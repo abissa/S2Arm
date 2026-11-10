@@ -1,0 +1,78 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 02292e2..dcc48ba 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3207,6 +3207,24 @@ static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt) {
+             static int said_a; if (said_a++ < 60) MLOG("[sparse] %s texture: %llu level-layer mappings, %llu tiles (%llu MB) mapped, %llu of %llu tiles used; device allocation %+lld MB by the mapping, now %llu MB", spi->gpu ? "GPU" : "packaged", (unsigned long long)n, (unsigned long long)tiles_total, (unsigned long long)((tiles_total * spi->tileBytes) >> 20), (unsigned long long)spi->used, (unsigned long long)spi->cap, (long long)((int64_t)(g_dev.currentAllocatedSize - am0) >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20)); }
+     }
+ }
++// S2Arm (fork): a re-upload of a packaged sparse texture goes into the same texture when the level-layers that got pages since fit in its heap; only the level-layers whose mapping or physical pages
++//   changed go up again (before, every re-upload built a new heap + texture and sent every mapped level-layer again: 0.2 - 0.9 s stalls on Mario Kart World's virtual texture arrays)
++static int g_sp_incr; static uint64_t g_sp_incr_vgen, g_sp_incr_stamp;
++static int sparse_incr_ok(id<MTLTexture> mt, const tex_t *t) {
++    SpInfo *spi = sp_info(mt); if (!spi || !spi->heap || spi->gpu || spi->pool != t->pool || spi->base != (uint8_t *)t->mem || spi->size != t->L.size) return 0;
++    uint32_t nl = spi->td.levels ? spi->td.levels : 1; uint64_t need = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
++    for (unsigned l = 0; l < spi->nlev; l++) {
++        uint32_t w = MAX(spi->td.width >> l, 1u), h = MAX(spi->td.height >> l, 1u);
++        for (unsigned y = 0; y < spi->layers; y++) {
++            if ([spi->mapped containsIndex:(NSUInteger)l * spi->layers + y]) continue;
++            uint64_t lo = (uint64_t)y * spi->lsz + nvn_tex_level_offset(&spi->td, l), hi = l + 1 < nl ? (uint64_t)y * spi->lsz + nvn_tex_level_offset(&spi->td, l + 1) : (uint64_t)(y + 1) * spi->lsz;
++            if (hi <= lo || hi > spi->size || !nvn_sparse_any_mapped(spi->pool, (uint64_t)(uintptr_t)spi->base + lo, hi - lo)) continue;
++            if (l >= spi->tailFirst) { if ([spi->tailDone containsIndex:y] || [tl containsIndex:y]) continue; [tl addIndex:y]; need += spi->tailTiles; }
++            else need += (uint64_t)((w + spi->tw - 1) / spi->tw) * ((h + spi->th - 1) / spi->th);
++        }
++    }
++    return spi->used + need <= spi->cap;
++}
+ // A GPU sparse texture follows the game's page mapping: when pages were mapped since the last look (and a few frames passed), the new ones get tiles
+ static void sparse_sync(SpInfo *spi, id<MTLTexture> mt) {
+     uint64_t g = nvn_sparse_gen(); if (g == spi->gen) return;
+@@ -3217,7 +3235,7 @@ static void sparse_sync(SpInfo *spi, id<MTLTexture> mt) {
+ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, uint64_t **ph, uint32_t *nph) {
+     MTLTextureDescriptor *d = tex_desc(t, 1);
+     if (!d) return nil;
+-    id<MTLTexture> mt = reuse && !reuse.heap && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
++    id<MTLTexture> mt = reuse && (!reuse.heap || g_sp_incr) && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
+                         ? reuse : (sparse_create(t, d, 0) ?: [g_dev newTextureWithDescriptor:d]);
+     if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
+     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
+@@ -3298,13 +3316,14 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+         //   Unmapped pages read as zero: a level with no page behind it is simply left as created.
+         up_begin();
+         uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0;
+-        SpInfo *spi = sp_info(mt); if (spi) sparse_map_pending(spi, mt);
++        SpInfo *spi = sp_info(mt); NSIndexSet *oldm = g_sp_incr && spi ? [spi->mapped copy] : nil; if (spi) sparse_map_pending(spi, mt);
+         for (unsigned l = 0; sp_ok && l < d.mipmapLevelCount; l++) {
+             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
+             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
+             for (unsigned y = 0; sp_ok && y < layers; y++) {
+                 uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
+                 if (hi <= lo || hi > t->L.size || !nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo)) continue;
++                if (oldm && [oldm containsIndex:(NSUInteger)l * spi->layers + y] && !nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo, g_sp_incr_vgen, g_sp_incr_stamp)) continue;   // in place: this level-layer is as uploaded
+                 size_t n = (size_t)(hi - lo); sp_lvls++; sp_all += n; if (n > sp_max) sp_max = n; uint8_t *tmp = big_alloc(n);
+                 if (!tmp) { static int said_sp; if (!said_sp++) MLOG("【红】 sparse texture ser=%llu level %u: cannot allocate %zu bytes: level left as created", (unsigned long long)t->serial, l, n); continue; }
+                 nvn_sparse_copy(t->pool, tmp, (uint64_t)(uintptr_t)t->mem + lo, n);
+@@ -4257,19 +4276,21 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+             // when the GPU is done with it (see NvPkg), else a new one; the old one becomes the spare (pkg_upload_ made nt resident)
+             id<MTLTexture> reuse = nil;
+             if (pk->spare) { pthread_mutex_lock(&g_mu); uint64_t done = g_done; pthread_mutex_unlock(&g_mu); if (pk->spare_fence <= done && pk->spare.usage == pk->tex.usage) reuse = pk->spare; }
++            int incr = 0; if (pk->sparse && sparse_incr_ok(pk->tex, t)) { reuse = pk->tex; incr = 1; g_sp_incr = 1; g_sp_incr_vgen = pk->vgen; g_sp_incr_stamp = pk->stamp; }   // S2Arm (fork): re-upload in place
+             if (dirtycheck() && !pk->sparse) {   // DM_NVN_DIRTYCHECK diagnostic: a re-upload whose bytes equal the last upload's = dirty pages without a content change (S2Arm 10-25 Mario Kart 8: 72,234 re-uploads)
+                 static uint64_t n, same, same_b; static uint32_t big_w, big_h; static uint64_t big_b, big_ser; n++;
+                 if (full_hash(t->mem, t->L.size) == pk->hash) { same++; same_b += t->L.size; if (t->L.size > big_b) { big_b = t->L.size; big_ser = t->serial; big_w = t->d.width; big_h = t->d.height; } }
+                 if (n % 2000 == 0) MLOG("[diag] packaged texture re-uploads: %llu, of which bytes unchanged since the last upload %llu (%.1f MB); largest unchanged ser=%llu %ux%u %.1f MB",
+                                         (unsigned long long)n, (unsigned long long)same, same_b / 1048576.0, (unsigned long long)big_ser, big_w, big_h, big_b / 1048576.0);
+             }
+-            uint64_t st, vg = nvn_sparse_gen(), *nh = NULL; uint32_t nn = 0; id<MTLTexture> nt = pkg_upload(t, &st, reuse, &nh, &nn);
++            uint64_t st, vg = nvn_sparse_gen(), *nh = NULL; uint32_t nn = 0, b0_ = (uint32_t)(g_bp_up_bytes >> 10); id<MTLTexture> nt = pkg_upload(t, &st, reuse, &nh, &nn); g_sp_incr = 0;
++            if (incr && nt) { static int said_i; static uint64_t n_i; n_i++; if (said_i++ < 40 || n_i % 200 == 0) MLOG("[sparse-incr] ser=%llu re-uploaded in place (%llu so far): %llu MB", (unsigned long long)t->serial, (unsigned long long)n_i, (unsigned long long)(((uint32_t)(g_bp_up_bytes >> 10) - b0_) >> 10)); }
+             if (!nt) free(nh);   // the hashes stay those of the content still uploaded
+             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; free(pk->ph); pk->ph = nh; pk->nph = nn; free(pk->pgpu); pk->pgpu = NULL;   // the new texture holds guest memory only
+                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
+                 if (pk->sparse) sparse_view(pk, t);
+                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
+-                pk->spare = old; pk->spare_fence = g_fence + 1; g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); }
++                if (old != nt) { pk->spare = old; pk->spare_fence = g_fence + 1; } g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); }
+             return pk->view ? pk->view : pk->tex;
+         }
+         pk = [NvPkg new];

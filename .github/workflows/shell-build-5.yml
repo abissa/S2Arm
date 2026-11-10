@@ -86,6 +86,8 @@ jobs:
           done
           exit 0
       - name: Build the shell
+        env:
+          S2A_SHELL_CLOSURE_SUGGEST: ${{ runner.temp }}/closure.tsv
         run: |
           mkdir -p "$S2A_CS_CACHE" "$S2A_VPX_CACHE" "$S2A_OPUS_CACHE" "$S2A_DAV1D_CACHE"
           set -o pipefail

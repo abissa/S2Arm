@@ -1,0 +1,17 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 4c9875f..7135a9d 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4771,6 +4771,12 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
+     for (uint64_t o = v ? (a - (uint64_t)(uintptr_t)v->base) & ~0xFFFull : 0, end = v ? a - (uint64_t)(uintptr_t)v->base + n : 0; ok && o < end; o += 0x1000) { const vpte *e = o < v->size ? vpt_get(v, o) : NULL; ok = e && e->phys; }
+     vp_unlock(); return ok;
+ }
++// S2Arm (fork): any page of [a, a+n) has memory behind it (nvn_sparse_mapped asks for every page)
++int nvn_sparse_any_mapped(const void *pool, uint64_t a, uint64_t n) {
++    vp_lock(); struct vpool *v = vpool_at(pool, a); int any = 0;
++    if (v) for (uint64_t o = (a - (uint64_t)(uintptr_t)v->base) & ~0xFFFull, end = a - (uint64_t)(uintptr_t)v->base + n; !any && o < end; o += 0x1000) { const vpte *e = o < v->size ? vpt_get(v, o) : NULL; any = e && e->phys; }
++    vp_unlock(); return any;
++}
+ void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
+ NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
+     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, GA(ib), GA(ind)});

@@ -13,14 +13,24 @@ index 69b1aee..feb15c8 100644
          // (the host passes the system's preferred languages, then Simplified / Traditional Chinese, then English). Null = upstream.
          public static Ryujinx.HLE.HOS.SystemState.TitleLanguage[] TitleLanguageFallback;
 diff --git a/services/S2A.Services/Application.cs b/services/S2A.Services/Application.cs
-index f90fd3a..9b91bba 100644
+index f90fd3a..ae5fd96 100644
 --- a/services/S2A.Services/Application.cs
 +++ b/services/S2A.Services/Application.cs
-@@ -67,6 +67,7 @@ namespace S2A.Services
-             metaLoader.Load(npdmBytes).ThrowIfFailure();
-             metaLoader.GetNpdm(out Npdm npdm).ThrowIfFailure();
-             ProgramId = npdm.Aci.ProgramId.Value;
-+            Ryujinx.HLE.S2AHooks.ProgramId = ProgramId;
-             if (requireSuccess && ProgramId != Native.ProgramId())
-                 throw new InvalidOperationException("Application NPDM and native process program IDs disagree");
-             if ((int)(ProgramId & 0xF) != programIndex)
+@@ -139,6 +139,17 @@ namespace S2A.Services
+             Aoc.Register(gameDir);   // DLC：aoc.tsv 里的全部登记为已拥有（有数据的挂 aoc/<idx>/，仅授权的挂载时报红）
+ 
+             Saves.SelectUser(device);
++            {
++                // S2Arm (fork): Switch 2 games may declare no user save size in the NACP but open an Account save anyway: make sure one is created
++                ref ApplicationControlProperty s2aCtl = ref nacp.Value;
++                Console.Error.WriteLine($"[nacp] user save {s2aCtl.UserAccountSaveDataSize:X}/{s2aCtl.UserAccountSaveDataJournalSize:X} device save {s2aCtl.DeviceSaveDataSize:X}/{s2aCtl.DeviceSaveDataJournalSize:X} owner {s2aCtl.SaveDataOwnerId:X16}");
++                if (s2aCtl.UserAccountSaveDataSize == 0)
++                {
++                    s2aCtl.UserAccountSaveDataSize = 0x4000000;
++                    s2aCtl.UserAccountSaveDataJournalSize = 0x1000000;
++                    Console.Error.WriteLine("[nacp] user save size was 0: set to 64 MB so an Account save is created");
++                }
++            }
+             Result saveResult = ProcessLoaderHelper.EnsureSaveData(device, new ApplicationId(applicationId), nacp);
+             if (requireSuccess) saveResult.ThrowIfFailure();
+             Saves.Seed(device, applicationId);

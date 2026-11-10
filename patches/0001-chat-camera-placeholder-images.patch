@@ -1,0 +1,89 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn2.c b/graphics/nvn/gfx/nvn/nvn2.c
+index 8dca966..283a948 100644
+--- a/graphics/nvn/gfx/nvn/nvn2.c
++++ b/graphics/nvn/gfx/nvn/nvn2.c
+@@ -244,6 +244,13 @@ static uint64_t chat_sync0(void *sync) { if (sync) memset(sync, 0, 16); return 0
+ //   由那里的构造函数登记（同 g_vi_vsync：nvn2.c 不对它有链接依赖）；没登记的（图形单测、安卓单库）这一族不接管
+ static uint64_t (*g_sev_attach)(void *sev, int autoclear);
+ void nvn2_sev_attach_register(uint64_t (*f)(void *, int)) { g_sev_attach = f; }
++// Get{Local,Remote}CameraImageHandle(storage, index)：Switch 2 游戏启动时按序号取摄像头视频图像的原生图像句柄（马里奥赛车 World：8 张，384x216），
++//   接着 nvnNativeImageBuilderSetNativeImageHandle → nvnNativeImageInitialize → nvnTextureInitializeFromNativeImage。原先回 0：nvnNativeImageInitialize 认不出（句柄不是宿主发的）→ 游戏 Break 中止。
++//   宿主没有摄像头、没在聊：回宿主发的占位图像句柄（nvn2_codec.c 登记，内容不写）；没登记的（图形单测、安卓单库）仍回 0
++static uint32_t (*g_cam_image)(int remote, int index);
++void nvn2_cam_image_register(uint32_t (*f)(int, int)) { g_cam_image = f; }
++static uint32_t chat_cam_local(const void *type, int index) { (void)type; return g_cam_image ? g_cam_image(0, index) : 0; }
++static uint32_t chat_cam_remote(const void *type, int index) { (void)type; return g_cam_image ? g_cam_image(1, index) : 0; }
+ static void chat_attach(void *sev) { if (sev && g_sev_attach) g_sev_attach(sev, 0); }
+ static void *chat_entry(const char *name) {
+     static const char P[] = "_ZN2nn4chat";
+@@ -259,6 +266,8 @@ static void *chat_entry(const char *name) {
+         {"15ReadAudioStreamEPmPvmRKNS_7account23NetworkServiceAccountIdE", (void *)chat_read0},
+         {"27RequestNextLocalCameraImageEPNS_2gs16NativeSyncHandleEPNS0_20LocalCameraVideoTypeEiS2_", (void *)chat_sync0},
+         {"28RequestNextRemoteCameraImageEPNS_2gs16NativeSyncHandleEPNS0_21RemoteCameraVideoTypeEiS2_RKNS_7account23NetworkServiceAccountIdE", (void *)chat_sync0},
++        {"25GetLocalCameraImageHandleEPKNS0_20LocalCameraVideoTypeEi", (void *)chat_cam_local},
++        {"26GetRemoteCameraImageHandleEPKNS0_21RemoteCameraVideoTypeEi", (void *)chat_cam_remote},
+     };
+     for (unsigned i = 0; i < sizeof t / sizeof *t; i++) if (!strcmp(n, t[i].n)) return t[i].f;
+     // 8 个 Attach*ChangedEvent（参数都是 nn::os::SystemEvent*）
+diff --git a/graphics/nvn/gfx/nvn/nvn2.h b/graphics/nvn/gfx/nvn/nvn2.h
+index bbe1032..beeb6de 100644
+--- a/graphics/nvn/gfx/nvn/nvn2.h
++++ b/graphics/nvn/gfx/nvn/nvn2.h
+@@ -67,6 +67,7 @@ int nvn2_device_integer(unsigned item, int *out);
+ void nvn2_device_init(void);
+ void nvn2_vi_vsync_register(void *f);   // nvn2_codec.c 构造函数登记 vi::GetDisplayVsyncEvent 的实现（nvn2.c 不对视频解码有链接依赖）
+ void nvn2_sev_attach_register(uint64_t (*f)(void *sev, int autoclear));   // nvn2_codec.c 构造函数登记「宿主事件挂到游戏 SystemEvent」（nn::chat 的 Attach*ChangedEvent 用；同上，无链接依赖）
++void nvn2_cam_image_register(uint32_t (*f)(int remote, int index));   // nvn2_codec.c 构造函数登记「GameChat 摄像头视频图像的占位原生图像句柄」（nn::chat 的 Get*CameraImageHandle 用；同上，无链接依赖）
+ 
+ // ---------- 宿主做不到的 SDK 函数：红桩（nvn2.c）----------
+ // 回一个桩：装载时打红行，被调到就中止并点名 name 与 why（与 sdk 原路径同样中止，但可诊断）；同名复用一个槽，256 槽满回 NULL
+diff --git a/graphics/nvn/gfx/nvn/nvn2_codec.c b/graphics/nvn/gfx/nvn/nvn2_codec.c
+index e1254ef..a394550 100644
+--- a/graphics/nvn/gfx/nvn/nvn2_codec.c
++++ b/graphics/nvn/gfx/nvn/nvn2_codec.c
+@@ -1030,6 +1030,45 @@ static const struct { const char *n; void *f; } g_ni_names[] = {
+     { "_ZN3nvn11NativeImage17InitializeTextureEPNS_7TextureE", (void *)ni_texture_cxx },
+ };
+ 
++// ---------- nn::chat 摄像头视频图像的占位原生图像 ----------
++// 马里奥赛车 World（Switch 2）启动时按序号取 8 张摄像头视频图像（384x216）建 NVN 纹理，哪怕没有聊天。宿主没有摄像头：每个序号发一张宿主自己的占位图像
++//   （RGBA、全 0、不写内容），登记在解码图像同一张表里（cv_img_get 认得，nvnNativeImageInitialize / nvnTextureInitializeFromNativeImage 照常走）。
++//   远端 / 本地各一套序号。内存自己分配（16 KB 对齐、整页），不用游戏给的缓冲（宿主的 nn::chat 实现把缓冲大小算 0）
++#define CAM_W 384
++#define CAM_H 216
++#define CAM_IDX 16
++static uint32_t g_cam_handle[2][CAM_IDX];
++static uint32_t cv_cam_image(int remote, int index) {
++    remote = remote ? 1 : 0;
++    if (index < 0 || index >= CAM_IDX) { CV_RED(camidx, "Switch 2 GameChat：摄像头视频图像序号 %d 超出 0..%d，回无效句柄", index, CAM_IDX - 1); return 0; }
++    pthread_mutex_lock(&g_img_mu);
++    uint32_t h = g_cam_handle[remote][index];
++    if (h && g_img_used[h - 1]) { pthread_mutex_unlock(&g_img_mu); return h; }
++    pthread_mutex_unlock(&g_img_mu);
++    cv_img im; memset(&im, 0, sizeof im);
++    im.kind = IMG_RGBA; im.w = CAM_W; im.h = CAM_H;
++    im.pitch = (uint32_t)al((size_t)CAM_W * 4, 256);
++    im.chroma_off = (size_t)im.pitch * al(im.h, 16);
++    im.size = al(im.chroma_off, 0x4000);
++    void *mem = NULL;
++    if (posix_memalign(&mem, 0x4000, im.size)) die("Switch 2 GameChat：摄像头占位图像内存不足");
++    memset(mem, 0, im.size);
++    pthread_mutex_lock(&g_img_mu);
++    int p = -1; for (int i = 0; i < CV_POOLS; i++) if (!g_cvp[i].used) { p = i; break; }
++    uint32_t first = 0;
++    for (uint32_t k = 0; p >= 0 && k < CV_IMAGES && !first; k++) { uint32_t s = (g_img_next + k) % CV_IMAGES; if (!g_img_used[s]) first = s + 1; }
++    if (p >= 0 && first) {
++        g_cvp[p] = (typeof(g_cvp[p])){ .used = 1, .mem = (uint8_t *)mem, .size = im.size };
++        cv_img *e = &g_img[first - 1]; *e = im; e->mem = (uint8_t *)mem; e->host = (uint8_t *)mem; e->pool = p;
++        g_img_used[first - 1] = 1; g_img_next = first % CV_IMAGES; g_cam_handle[remote][index] = first;
++    }
++    pthread_mutex_unlock(&g_img_mu);
++    if (!first || p < 0) { free(mem); LOG("【红】Switch 2 GameChat：放不下摄像头占位图像（池记录 %s）", p < 0 ? "满" : "有空"); return 0; }
++    static _Atomic int said; if (atomic_fetch_add(&said, 1) < 2) LOG("Switch 2 GameChat：%s摄像头视频图像 %d → 宿主占位原生图像 %u（%dx%d RGBA，不写内容；宿主没有摄像头）", remote ? "远端" : "本地", index, first, CAM_W, CAM_H);
++    return first;
++}
++__attribute__((constructor)) static void cam_image_reg(void) { nvn2_cam_image_register(cv_cam_image); }
++
+ static Result cv_lib_ok(void) { return RES_OK; }
+ // 不必接管（sdk 原路径可跑；依据见 4 款 sdk 的调用图与「gs 未启动」模拟执行，03_SDK接管层_报告）：纯计算 / 格式换算 / 只读本模块常量
+ static int ns2_pure(const char *n) {

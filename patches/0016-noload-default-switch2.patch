@@ -1,0 +1,13 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 547a19b..02292e2 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -10661,7 +10661,7 @@ static int noload_writes(NvProg *pr, uint32_t want, uint32_t *need) {   // → 1
+ // DM_NVN_NOLOAD=0：关免加载（恒返回 0，照常读入），真机 A/B 判因果用（11-07 金刚 hang、鬼灭黑地面）；缺省开。第一次开遍时打一行当前状态
+ static int g_noload_on = -1;
+ static int noload_on(void) {
+-    if (g_noload_on < 0) { const char *e = getenv("DM_NVN_NOLOAD"); g_noload_on = !(e && !strcmp(e, "0"));
++    if (g_noload_on < 0) { const char *e = getenv("DM_NVN_NOLOAD"); g_noload_on = e && *e ? strcmp(e, "0") != 0 : !nvn2_on();   /* S2Arm (fork): off by default for Switch 2 games (Mario Kart World came out pink-tinted); DM_NVN_NOLOAD=1 / 0 still decides */
+         MLOG("color attachments proven unwritten to the pass end not loaded: %s (DM_NVN_NOLOAD%s)", g_noload_on ? "on" : "off, every attachment loaded", g_noload_on ? "=0 turns it off" : "=0"); }
+     return g_noload_on;
+ }

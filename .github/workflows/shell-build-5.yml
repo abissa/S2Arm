@@ -47,7 +47,7 @@ jobs:
           python3 -m pip install -r tools/rewriter-requirements.txt -r pack/fonts/requirements.txt
       - name: Pinned sources used by the build
         run: |
-          python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+          python3 runtime/rewriter/prepare_deps.py build/rewriter-deps || test -d build/rewriter-deps/capstone-5.0.7
           bash services/systemdata/make_tzdata.sh --prepare-sources
           bash compat/fetch_base.sh
       - name: Apply patches from the fork (if any)

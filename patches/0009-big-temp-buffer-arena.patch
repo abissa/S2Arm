@@ -1,0 +1,47 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 7d2c978..218fe12 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3093,6 +3093,21 @@ static int guest_mem_readable(const void *p, size_t n) {
+     }
+     return 1;
+ }
++// S2Arm (fork): a temporary buffer as big as a sparse texture (400 MB for Mario Kart World) found no hole in the nearly full low region and malloc failed (FATAL). The virtual-pool arena
++//   (runtime/src/vawin.c, a contiguous reservation below the window) lends the address range; the pages are committed with mprotect and given back with the range
++void *s2a_vp_arena_map(uint64_t len) __attribute__((weak)); int s2a_vp_arena_has(const void *p, uint64_t n) __attribute__((weak)); void s2a_vp_arena_free(const void *p, uint64_t len) __attribute__((weak));
++static void *big_alloc(size_t n) {
++    void *p = malloc(n); if (p) return p;
++    if (!s2a_vp_arena_map) return NULL;
++    size_t r = (n + 16383) & ~(size_t)16383; p = s2a_vp_arena_map(r); if (!p) return NULL;
++    if (mprotect(p, r, PROT_READ | PROT_WRITE)) { s2a_vp_arena_free(p, r); return NULL; }
++    return p;
++}
++static void big_free(void *p, size_t n) {
++    if (!p) return;
++    size_t r = (n + 16383) & ~(size_t)16383;
++    if (s2a_vp_arena_has && s2a_vp_arena_has(p, r)) { mmap(p, r, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); s2a_vp_arena_free(p, r); } else free(p);
++}
+ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, uint64_t **ph, uint32_t *nph) {
+     MTLTextureDescriptor *d = tex_desc(t, 1);
+     if (!d) return nil;
+@@ -3172,9 +3187,9 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+     }
+ 
+     // A sparse pool's texture is read through a copy gathered from its page table, unmapped pages as 0 (a mip tail at a 4 KB offset has no host alias; reading the alias stopped the host with SIGBUS)
+-    const uint8_t *src = t->mem; uint8_t *part = NULL;
++    const uint8_t *src = t->mem; uint8_t *part = NULL; size_t partn = t->L.size ? t->L.size : 1;
+     if (sparse) {
+-        if (!(part = malloc(t->L.size ? t->L.size : 1))) MDIE("sparse texture copy of %llu bytes failed", (unsigned long long)t->L.size);
++        if (!(part = big_alloc(partn))) MDIE("sparse texture copy of %llu bytes failed", (unsigned long long)t->L.size);
+         nvn_sparse_copy(t->pool, part, (uint64_t)(uintptr_t)t->mem, t->L.size); src = part;
+     }
+     up_begin();
+@@ -3205,7 +3220,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+             off += pitch * rows * z;
+         }
+     }
+-    free(part);
++    big_free(part, partn);
+     up_flush();
+     return mt;
+ }

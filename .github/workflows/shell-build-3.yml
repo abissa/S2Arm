@@ -1,0 +1,76 @@
+name: shell-build-3
+# Experiment: build S2Arm's iPhone app ("shell") on a free GitHub macOS runner.
+# The runner only has the iOS 26.5 SDK, so this run changes the pinned SDK major from 27 to 26
+# (committed locally on the runner only; nothing is pushed back) and then runs pack/shell_build.sh.
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: compat/tree/global.json
+      - name: Tools and pinned Python packages
+        run: |
+          brew install bash make cmake nasm meson ninja || true
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "$pythonLocation/bin" >> "$GITHUB_PATH"
+          python3 -m pip install -r tools/rewriter-requirements.txt -r pack/fonts/requirements.txt
+      - name: Pinned sources used by the build
+        run: |
+          python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+          bash services/systemdata/make_tzdata.sh --prepare-sources
+          bash compat/fetch_base.sh
+      - name: Use the iOS 26 SDK major (experiment)
+        run: |
+          sed -i '' 's/^IPHONEOS_SDK_MAJOR=27/IPHONEOS_SDK_MAJOR=26/' tools/toolchain.env
+          grep IPHONEOS_SDK_MAJOR tools/toolchain.env
+          git config user.email "ci@example.invalid"
+          git config user.name "ci"
+          git commit -am "experiment: pin iOS SDK major 26 (runner-local)"
+      - name: Opus source from mirrors (xiph.org resets the connection from GitHub runners)
+        run: |
+          SHA=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
+          D="$HOME/.cache/s2arm-build/sources/$SHA"; mkdir -p "$D"
+          for u in https://github.com/xiph/opus/releases/download/v1.6.1/opus-1.6.1.tar.gz https://ftp.osuosl.org/pub/xiph/releases/opus/opus-1.6.1.tar.gz https://ftp.mozilla.org/pub/opus/opus-1.6.1.tar.gz; do
+            echo "try $u"
+            curl -fL --retry 3 -o "$D/opus-1.6.1.tar.gz" "$u" || continue
+            if [ "$(shasum -a 256 "$D/opus-1.6.1.tar.gz" | cut -d' ' -f1)" = "$SHA" ]; then echo "sha256 OK from $u"; exit 0; fi
+            echo "sha256 mismatch from $u"; rm -f "$D/opus-1.6.1.tar.gz"
+          done
+          echo "no mirror worked"; exit 1
+      - name: Native libraries (diagnostics first, so errors are visible)
+        run: |
+          set +e
+          for lib in opus vpx dav1d; do
+            echo "=== services/$lib/build.sh ios-arm64"
+            bash services/$lib/build.sh ios-arm64 2>&1 | tail -60
+            echo "exit: ${PIPESTATUS[0]}"
+          done
+          exit 0
+      - name: Build the shell
+        run: |
+          set -o pipefail
+          bash pack/shell_build.sh "$RUNNER_TEMP/shell" 2>&1 | tee "$RUNNER_TEMP/shell_build.log"
+      - name: Upload the shell
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2arm-shell
+          path: ${{ runner.temp }}/shell
+          retention-days: 5
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-build-log
+          path: ${{ runner.temp }}/shell_build.log
+          retention-days: 5

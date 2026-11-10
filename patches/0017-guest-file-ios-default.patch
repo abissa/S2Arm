@@ -1,0 +1,22 @@
+diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
+index 18fe1ff..3758402 100644
+--- a/runtime/src/vawin.c
++++ b/runtime/src/vawin.c
+@@ -157,13 +157,16 @@ static void guest_file_attach_(void) {
+                     : seen == UINT64_MAX ? "自动：本款实测峰值记录读不出（坏记录），保守开"
+                     : seen ? (on ? "自动：本机本款实测峰值 + 余量大于剩余，装不下" : "自动：本机本款实测峰值 + 余量不大于剩余，装得下、保持匿名内存")
+                     : (on ? "自动：没有本款实测，池 + 宿主开销估计 + 余量大于剩余，装不下" : "自动：没有本款实测，池 + 宿主开销估计 + 余量不大于剩余，装得下、保持匿名内存");
++#ifdef __IPHONE_OS_VERSION_MIN_REQUIRED
++    if (!on && !(e && *e) && pool >= (8ull << 30)) { on = 1; LOG("客体内存文件后备：S2Arm 分支：池 %llu MB（≥ 8 GB）在 iPhone / iPad 上一律开", (unsigned long long)(pool >> 20)); }   /* S2Arm (fork): a 9 GB guest pool in RAM reaches the per-app limit (iPad 12.3 GB) */
++#endif
+     LOG("客体内存文件后备：%s——%s；本款应用内存池 %llu MB、离单进程内存上限还剩 %llu MB%s、本机本款实测峰值 %llu MB（0 = 没有）、宿主开销估计 %llu MB%s", on ? "开" : "关", why,
+         (unsigned long long)(pool >> 20), (unsigned long long)(room >> 20), room ? "" : "（0 = 未知）", (unsigned long long)(seen == UINT64_MAX ? 0 : seen >> 20), (unsigned long long)(host >> 20), s2a_process_prewarmed() ? "；预热进程" : "");
+     if (!on) return;
+     const char *td = getenv("TMPDIR"); char path[1024]; snprintf(path, sizeof path, "%s/s2a_guest_%d.bin", td && *td ? td : "/tmp", (int)getpid());
+     // 起局前查闪存剩余空间（11-05 能耗线）：文件稀疏，只占内核写回的块，最坏涨到游戏弄脏的客体内存总量（Switch 2 是 12 GB）。
+     //   不够就不接文件、照旧用匿名内存（等于开关关），打一行黄；门槛 S2A_GUEST_FILE_MIN_FREE_MB（缺省 12288）
+-    { const char *m = getenv("S2A_GUEST_FILE_MIN_FREE_MB"); uint64_t need = (m && *m ? strtoull(m, NULL, 10) : 12288ull) << 20; struct statfs sf;
++    { const char *m = getenv("S2A_GUEST_FILE_MIN_FREE_MB"); uint64_t need = (m && *m ? strtoull(m, NULL, 10) : 3072ull) << 20; struct statfs sf;
+       if (statfs(td && *td ? td : "/tmp", &sf)) { LOG("【黄】客体内存文件后备：查不了临时目录剩余空间（errno=%d），照旧用匿名内存", errno); return; }
+       uint64_t avail = (uint64_t)sf.f_bavail * (uint64_t)sf.f_bsize;
+       if (avail < need) { LOG("【黄】客体内存文件后备：临时目录剩余 %llu MB < 需要 %llu MB（S2A_GUEST_FILE_MIN_FREE_MB），照旧用匿名内存", (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20)); return; } }

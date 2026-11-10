@@ -1,21 +1,24 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index a72773f..7668bb8 100644
+index a72773f..7cf6506 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
-@@ -297,6 +297,12 @@ static void big_tex_res(id<MTLResource> r, int line) {
+@@ -297,6 +297,15 @@ static void big_tex_res(id<MTLResource> r, int line) {
  //   驻留集增删等）就永远放不掉。11-06 DOOM Eternal（c1106_rj13）：游戏释放的内存池 34 个 2720 MB 的零拷贝缓冲一直活着（「freed but alive」），
  //   GPU 已分配 4645 MB；删池时线程自动释放池里挂着 36–56 个缓冲对象。池生命周期上这四处入口（建池 / 删池 / 进驻留集 / 出驻留集）各自带池：
  //   改后同局 freed but alive 0、GPU 已分配 1920 MB
 +// S2Arm (fork): Metal sparse textures. Mario Kart World's virtual textures (8192x8192 arrays of 68 layers, up to 5.8 GB each) were created whole and took the process past iOS's
 +//   memory limit. A sparse texture is created from a (tiny) sparse heap and only the tiles that hold mapped pages get memory: SpInfo keeps the mapping heap and its tile accounting
-+@interface SpInfo : NSObject { @public id<MTLHeap> heap0, heap; uint64_t cap, used, tileBytes; NSUInteger tw, th, tailFirst, tailTiles; NSMutableIndexSet *tailDone; } @end
-+@implementation SpInfo @end
++static _Atomic uint64_t g_sp_live_n, g_sp_live_bytes, g_sp_created;
++@interface SpInfo : NSObject { @public id<MTLHeap> heap0, heap; uint64_t hbytes, cap, used, tileBytes; NSUInteger tw, th, tailFirst, tailTiles; NSMutableIndexSet *tailDone; } @end
++@implementation SpInfo
++- (void)dealloc { if (hbytes) { atomic_fetch_sub(&g_sp_live_bytes, hbytes); atomic_fetch_sub(&g_sp_live_n, 1); } }
++@end
 +static const char g_sp_key = 0;
 +static SpInfo *sp_info(id r) { return r ? objc_getAssociatedObject(r, &g_sp_key) : nil; }
  static void res_add_at_body(id<MTLResource> r, int line);
  static void res_add_at(id<MTLResource> r, int line) { @autoreleasepool { res_add_at_body(r, line); } }
  static void res_add_at_body(id<MTLResource> r, int line) {
-@@ -313,6 +319,7 @@ static void res_add_at_body(id<MTLResource> r, int line) {
+@@ -313,6 +322,7 @@ static void res_add_at_body(id<MTLResource> r, int line) {
      pthread_mutex_unlock(&g_res_mu);
  }
  static int pool_pin_retire(void *r);   // a pool table names it (pool_ent_put): it stays resident until no entry does
@@ -23,7 +26,7 @@ index a72773f..7668bb8 100644
  static void res_remove_body(id<MTLResource> r);
  static void res_remove(id<MTLResource> r) { @autoreleasepool { res_remove_body(r); } }
  static void res_remove_body(id<MTLResource> r) {
-@@ -322,6 +329,7 @@ static void res_remove_body(id<MTLResource> r) {
+@@ -322,6 +332,7 @@ static void res_remove_body(id<MTLResource> r) {
      if (pool_pin_retire((__bridge void *)r)) { pthread_mutex_unlock(&g_res_mu); return; }
      [g_res removeAllocation:(id<MTLAllocation>)r];
      [g_res_objects removeObject:r];
@@ -31,7 +34,7 @@ index a72773f..7668bb8 100644
      if (g_m3 && [r conformsToProtocol:@protocol(MTLBuffer)]) m3_buf_del((id<MTLBuffer>)r);
      g_res_dirty = 1; g_rs_rm++;
      pthread_mutex_unlock(&g_res_mu);
-@@ -3109,11 +3117,86 @@ static void big_free(void *p, size_t n) {
+@@ -3109,11 +3120,89 @@ static void big_free(void *p, size_t n) {
      size_t r = (n + 16383) & ~(size_t)16383;
      if (s2a_vp_arena_has && s2a_vp_arena_has(p, r)) { mmap(p, r, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); s2a_vp_arena_free(p, r); } else free(p);
  }
@@ -68,15 +71,17 @@ index a72773f..7668bb8 100644
 +        }
 +    }
 +    uint64_t bytes = (need + need / 8 + 64) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // a little slack, whole MB
-+    id<MTLHeap> hp = sp_heap((NSUInteger)bytes); if (!hp) { static int said_h; if (!said_h++) MLOG("【红】 sparse texture: cannot create a %llu MB sparse heap (first case): texture created whole", (unsigned long long)(bytes >> 20)); return nil; }
++    uint64_t al0 = g_dev.currentAllocatedSize;
++    id<MTLHeap> hp = sp_heap((NSUInteger)bytes); uint64_t al1 = g_dev.currentAllocatedSize; if (!hp) { static int said_h; if (!said_h++) MLOG("【红】 sparse texture: cannot create a %llu MB sparse heap (first case): texture created whole", (unsigned long long)(bytes >> 20)); return nil; }
 +    id<MTLTexture> mt = [hp newTextureWithDescriptor:sd];
 +    if (!mt) { static int said_t; if (!said_t++) MLOG("【红】 sparse texture ser=%llu: cannot create it on its heap (first case): created whole", (unsigned long long)t->serial); return nil; }
-+    SpInfo *spi = [SpInfo new]; spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet];
++    uint64_t al2 = g_dev.currentAllocatedSize;
++    SpInfo *spi = [SpInfo new]; spi->hbytes = bytes; atomic_fetch_add(&g_sp_live_bytes, bytes); atomic_fetch_add(&g_sp_live_n, 1); atomic_fetch_add(&g_sp_created, 1); spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet];
 +    objc_setAssociatedObject(mt, &g_sp_key, spi, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 +    if (0) res_add_heap(hp);   // the heap is not put in the residency set: committing the set with sparse heaps in it crashed inside Metal (null object in res_commit)
-+    { static int said_s; if (said_s++ < 12) MLOG("[sparse] texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed for its mapped pages (%llu MB), heap %llu MB",
++    { static int said_s; if (said_s++ < 40) MLOG("[sparse] texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed for its mapped pages (%llu MB), heap %llu MB; device allocation +%lld MB after the heap, +%lld MB after the texture; %llu sparse textures alive (%llu MB of heaps), %llu created in all",
 +        (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
-+        (unsigned long)tailFirst, (unsigned long)tailTiles, (unsigned long long)need, (unsigned long long)((need * tileBytes) >> 20), (unsigned long long)(bytes >> 20)); }
++        (unsigned long)tailFirst, (unsigned long)tailTiles, (unsigned long long)need, (unsigned long long)((need * tileBytes) >> 20), (unsigned long long)(bytes >> 20), (long long)((int64_t)(al1 - al0) >> 20), (long long)((int64_t)(al2 - al1) >> 20), (unsigned long long)atomic_load(&g_sp_live_n), (unsigned long long)(atomic_load(&g_sp_live_bytes) >> 20), (unsigned long long)atomic_load(&g_sp_created)); }
 +    return mt;
 +}
 +// Maps the tiles of every level and layer that holds mapped pages, in one submission on a classic Metal queue (the Metal 4 queue's updateTextureMappings crashed inside Metal on this OS);
@@ -87,6 +92,7 @@ index a72773f..7668bb8 100644
 +    @autoreleasepool {
 +        if (!g_qs) g_qs = [g_dev newCommandQueue];
 +        if (!g_qs) return;
++        uint64_t am0 = g_dev.currentAllocatedSize;
 +        id<MTLCommandBuffer> cb = [g_qs commandBuffer]; id<MTLResourceStateCommandEncoder> en = [cb resourceStateCommandEncoder];
 +        if (!en) return;
 +        uint64_t n = 0, tiles_total = 0;
@@ -107,7 +113,7 @@ index a72773f..7668bb8 100644
 +        }
 +    done:
 +        [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
-+        { static int said_a; if (said_a++ < 12) MLOG("[sparse] texture ser=%llu: %llu level-layer mappings, %llu tiles (%llu MB) mapped", (unsigned long long)t->serial, (unsigned long long)n, (unsigned long long)tiles_total, (unsigned long long)((tiles_total * spi->tileBytes) >> 20)); }
++        { static int said_a; if (said_a++ < 40) MLOG("[sparse] texture ser=%llu: %llu level-layer mappings, %llu tiles (%llu MB) mapped; device allocation %+lld MB by the mapping, now %llu MB", (unsigned long long)t->serial, (unsigned long long)n, (unsigned long long)tiles_total, (unsigned long long)((tiles_total * spi->tileBytes) >> 20), (long long)((int64_t)(g_dev.currentAllocatedSize - am0) >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20)); }
 +    }
 +}
  static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, uint64_t **ph, uint32_t *nph) {
@@ -120,7 +126,7 @@ index a72773f..7668bb8 100644
      if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
      if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
      res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
-@@ -3193,6 +3276,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+@@ -3193,6 +3282,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
          //   Unmapped pages read as zero: a level with no page behind it is simply left as created.
          up_begin();
          uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0;

@@ -1,0 +1,17 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index b6ac970..7b26954 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4248,7 +4248,11 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+         if (!d) return nil;
+         mt = [g_dev newTextureWithDescriptor:d];
+         if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
+-        res_add(mt); if (!tex_init_fill(t, mt)) tex_zero_fill(mt);   // register residency before filling (the copy destination must be resident too)
++        res_add(mt);   // register residency before filling (the copy destination must be resident too)
++        // S2Arm (fork): a very large texture of a sparse (virtual) pool holds nothing yet (Mario Kart World: 61 textures of 8192x8192, about 340 MB each, 144 KB resident): writing zeros over all of it
++        //   committed the whole GPU allocation and took the process past iOS's 8 GB limit. Its pages are not written until something draws into it or the game maps data there
++        if (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && mt.allocatedSize >= (64u << 20)) { static int said_big; if (!said_big++) MLOG("[sparse-big] first very large sparse-pool texture ser=%llu %llu MB: not zero-filled (later ones are not logged)", (unsigned long long)t->serial, (unsigned long long)(mt.allocatedSize >> 20)); }
++        else if (!tex_init_fill(t, mt)) tex_zero_fill(mt);
+         if (big_tex_on() && mt.allocatedSize >= (4u << 20)) {   // 大贴图建立账（big_tex_res）：NVN 侧描述 + 存储有没有被游戏碰过（mincore，不读页）
+             uint64_t touched = 0; size_t pg = (size_t)getpagesize(); unsigned char vec[512];
+             for (uint64_t a = (uint64_t)(uintptr_t)t->mem & ~(uint64_t)(pg - 1), e = (uint64_t)(uintptr_t)t->mem + t->L.size; t->mem && a < e; a += sizeof vec * pg) {

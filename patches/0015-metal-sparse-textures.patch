@@ -1,15 +1,16 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index a72773f..7cf6506 100644
+index a72773f..547a19b 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
-@@ -297,6 +297,15 @@ static void big_tex_res(id<MTLResource> r, int line) {
+@@ -297,6 +297,16 @@ static void big_tex_res(id<MTLResource> r, int line) {
  //   驻留集增删等）就永远放不掉。11-06 DOOM Eternal（c1106_rj13）：游戏释放的内存池 34 个 2720 MB 的零拷贝缓冲一直活着（「freed but alive」），
  //   GPU 已分配 4645 MB；删池时线程自动释放池里挂着 36–56 个缓冲对象。池生命周期上这四处入口（建池 / 删池 / 进驻留集 / 出驻留集）各自带池：
  //   改后同局 freed but alive 0、GPU 已分配 1920 MB
 +// S2Arm (fork): Metal sparse textures. Mario Kart World's virtual textures (8192x8192 arrays of 68 layers, up to 5.8 GB each) were created whole and took the process past iOS's
-+//   memory limit. A sparse texture is created from a (tiny) sparse heap and only the tiles that hold mapped pages get memory: SpInfo keeps the mapping heap and its tile accounting
++//   memory limit. A sparse texture is created from a sparse heap and only the tiles that hold mapped pages get memory: SpInfo keeps the heap, the tile accounting and what is needed to map more later
 +static _Atomic uint64_t g_sp_live_n, g_sp_live_bytes, g_sp_created;
-+@interface SpInfo : NSObject { @public id<MTLHeap> heap0, heap; uint64_t hbytes, cap, used, tileBytes; NSUInteger tw, th, tailFirst, tailTiles; NSMutableIndexSet *tailDone; } @end
++@interface SpInfo : NSObject { @public id<MTLHeap> heap; uint64_t hbytes, cap, used, tileBytes; NSUInteger tw, th, tailFirst, tailTiles; NSMutableIndexSet *tailDone, *mapped;
++    const void *pool; uint8_t *base; uint64_t size, gen, frame; nvn_texdesc td; uint64_t lsz; unsigned layers, nlev; int gpu; } @end
 +@implementation SpInfo
 +- (void)dealloc { if (hbytes) { atomic_fetch_sub(&g_sp_live_bytes, hbytes); atomic_fetch_sub(&g_sp_live_n, 1); } }
 +@end
@@ -18,7 +19,7 @@ index a72773f..7cf6506 100644
  static void res_add_at_body(id<MTLResource> r, int line);
  static void res_add_at(id<MTLResource> r, int line) { @autoreleasepool { res_add_at_body(r, line); } }
  static void res_add_at_body(id<MTLResource> r, int line) {
-@@ -313,6 +322,7 @@ static void res_add_at_body(id<MTLResource> r, int line) {
+@@ -313,6 +323,7 @@ static void res_add_at_body(id<MTLResource> r, int line) {
      pthread_mutex_unlock(&g_res_mu);
  }
  static int pool_pin_retire(void *r);   // a pool table names it (pool_ent_put): it stays resident until no entry does
@@ -26,29 +27,33 @@ index a72773f..7cf6506 100644
  static void res_remove_body(id<MTLResource> r);
  static void res_remove(id<MTLResource> r) { @autoreleasepool { res_remove_body(r); } }
  static void res_remove_body(id<MTLResource> r) {
-@@ -322,6 +332,7 @@ static void res_remove_body(id<MTLResource> r) {
+@@ -322,6 +333,7 @@ static void res_remove_body(id<MTLResource> r) {
      if (pool_pin_retire((__bridge void *)r)) { pthread_mutex_unlock(&g_res_mu); return; }
      [g_res removeAllocation:(id<MTLAllocation>)r];
      [g_res_objects removeObject:r];
-+    { SpInfo *spi = sp_info(r); if (spi) { if (spi->heap0) [g_res removeAllocation:(id<MTLAllocation>)spi->heap0]; if (spi->heap) [g_res removeAllocation:(id<MTLAllocation>)spi->heap]; } }
++    { SpInfo *spi = sp_info(r); if (spi && spi->heap) [g_res removeAllocation:(id<MTLAllocation>)spi->heap]; }
      if (g_m3 && [r conformsToProtocol:@protocol(MTLBuffer)]) m3_buf_del((id<MTLBuffer>)r);
      g_res_dirty = 1; g_rs_rm++;
      pthread_mutex_unlock(&g_res_mu);
-@@ -3109,11 +3120,89 @@ static void big_free(void *p, size_t n) {
+@@ -3109,11 +3121,104 @@ static void big_free(void *p, size_t n) {
      size_t r = (n + 16383) & ~(size_t)16383;
      if (s2a_vp_arena_has && s2a_vp_arena_has(p, r)) { mmap(p, r, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); s2a_vp_arena_free(p, r); } else free(p);
  }
++static int sparse_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_SPARSE_GPU"); v = e && *e && strcmp(e, "0"); } return v; }   // render-target textures of sparse pools as sparse textures too (S2A_SPARSE_GPU=1)
 +static id<MTLHeap> sp_heap(NSUInteger bytes) {
 +    MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked; hd.size = bytes;
 +    return [g_dev newHeapWithDescriptor:hd];
 +}
-+static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d) {   // nil = not a texture for this (create it whole, as before)
++static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt);
++static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int gpu) {   // nil = not a texture for this (create it whole, as before)
 +    if (!g_q4 || !g_dev || !t->pool || !nvn_sparse_pool(t->pool)) return nil;
 +    if (d.textureType != MTLTextureType2D && d.textureType != MTLTextureType2DArray) return nil;
 +    if (d.sampleCount > 1) return nil;
 +    MTLSizeAndAlign sa = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
-+    if (sa.size < (256ull << 20)) return nil;
++    if (sa.size < (gpu ? (64ull << 20) : (256ull << 20))) return nil;
 +    if (![g_dev supportsFamily:MTLGPUFamilyApple6]) return nil;
++    { static int probed; if (!probed++) { const char *e = getenv("S2A_SPARSE_PROBE"); int mb = e ? atoi(e) : 0;   // does a big, empty sparse heap cost memory? (watch the process footprint)
++        if (mb > 0) { uint64_t a0 = g_dev.currentAllocatedSize; static id<MTLHeap> keep; keep = sp_heap((NSUInteger)mb << 20); MLOG("[sparse-probe] an empty sparse heap of %d MB: %s, device allocation %+lld MB (kept alive)", mb, keep ? "created" : "FAILED", (long long)((int64_t)(g_dev.currentAllocatedSize - a0) >> 20)); } } }
 +    NSUInteger tileBytes = g_dev.sparseTileSizeInBytes; if (!tileBytes) return nil;
 +    MTLSize ts = [g_dev sparseTileSizeWithTextureType:d.textureType pixelFormat:d.pixelFormat sampleCount:1];
 +    if (!ts.width || !ts.height) return nil;
@@ -58,63 +63,74 @@ index a72773f..7cf6506 100644
 +    { id<MTLHeap> hq = sp_heap(1u << 20); id<MTLTexture> q = hq ? [hq newTextureWithDescriptor:sd] : nil;
 +      if (!q) { static int said_q; if (!said_q++) MLOG("【红】 sparse texture ser=%llu %lux%lu format %lu: cannot create a sparse texture (first case): created whole", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat); return nil; }
 +      tailFirst = q.firstMipmapInTail; tailTiles = (q.tailSizeInBytes + tileBytes - 1) / tileBytes; }
-+    // tiles for the level-layers that hold mapped pages now (a level's mip tail counts once per layer)
++    // tiles: for a packaged texture those of the level-layers that hold mapped pages now; for a GPU texture (gpu) all of them (pages are mapped as the game maps them, see sparse_sync)
 +    uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; unsigned layers = tex_layers(t);
-+    uint64_t need = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
++    uint64_t need = 0, mappedNow = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
 +    for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
 +        uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u);
 +        for (unsigned y = 0; y < layers; y++) {
 +            uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
-+            if (hi <= lo || hi > t->L.size || !nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo)) continue;
++            if (hi <= lo || hi > t->L.size) continue;
++            int any = nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo);
++            if (any) mappedNow += hi - lo;
++            if (!gpu && !any) continue;
 +            if (l >= tailFirst) { if (![tl containsIndex:y]) { [tl addIndex:y]; need += tailTiles; } }
 +            else need += (uint64_t)((w + ts.width - 1) / ts.width) * ((h + ts.height - 1) / ts.height);
 +        }
 +    }
 +    uint64_t bytes = (need + need / 8 + 64) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // a little slack, whole MB
 +    uint64_t al0 = g_dev.currentAllocatedSize;
-+    id<MTLHeap> hp = sp_heap((NSUInteger)bytes); uint64_t al1 = g_dev.currentAllocatedSize; if (!hp) { static int said_h; if (!said_h++) MLOG("【红】 sparse texture: cannot create a %llu MB sparse heap (first case): texture created whole", (unsigned long long)(bytes >> 20)); return nil; }
++    id<MTLHeap> hp = sp_heap((NSUInteger)bytes); uint64_t al1 = g_dev.currentAllocatedSize;
++    if (!hp) { static int said_h; if (!said_h++) MLOG("【红】 sparse texture: cannot create a %llu MB sparse heap (first case): texture created whole", (unsigned long long)(bytes >> 20)); return nil; }
 +    id<MTLTexture> mt = [hp newTextureWithDescriptor:sd];
 +    if (!mt) { static int said_t; if (!said_t++) MLOG("【红】 sparse texture ser=%llu: cannot create it on its heap (first case): created whole", (unsigned long long)t->serial); return nil; }
 +    uint64_t al2 = g_dev.currentAllocatedSize;
-+    SpInfo *spi = [SpInfo new]; spi->hbytes = bytes; atomic_fetch_add(&g_sp_live_bytes, bytes); atomic_fetch_add(&g_sp_live_n, 1); atomic_fetch_add(&g_sp_created, 1); spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet];
++    SpInfo *spi = [SpInfo new]; spi->hbytes = bytes; atomic_fetch_add(&g_sp_live_bytes, bytes); atomic_fetch_add(&g_sp_live_n, 1); atomic_fetch_add(&g_sp_created, 1); spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet]; spi->mapped = [NSMutableIndexSet indexSet];
++    spi->pool = t->pool; spi->base = (uint8_t *)t->mem; spi->size = t->L.size; spi->td = t->d; spi->lsz = ls; spi->layers = layers; spi->nlev = (unsigned)d.mipmapLevelCount; spi->gpu = gpu;
 +    objc_setAssociatedObject(mt, &g_sp_key, spi, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 +    if (0) res_add_heap(hp);   // the heap is not put in the residency set: committing the set with sparse heaps in it crashed inside Metal (null object in res_commit)
-+    { static int said_s; if (said_s++ < 40) MLOG("[sparse] texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed for its mapped pages (%llu MB), heap %llu MB; device allocation +%lld MB after the heap, +%lld MB after the texture; %llu sparse textures alive (%llu MB of heaps), %llu created in all",
-+        (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
++    { static int said_s; if (said_s++ < 60) MLOG("[sparse] %s texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB, %llu MB of it with mapped pages now) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed (%llu MB), heap %llu MB; device allocation +%lld MB after the heap, +%lld MB after the texture; %llu sparse textures alive (%llu MB of heaps), %llu created in all",
++        gpu ? "GPU" : "packaged", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long long)(mappedNow >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
 +        (unsigned long)tailFirst, (unsigned long)tailTiles, (unsigned long long)need, (unsigned long long)((need * tileBytes) >> 20), (unsigned long long)(bytes >> 20), (long long)((int64_t)(al1 - al0) >> 20), (long long)((int64_t)(al2 - al1) >> 20), (unsigned long long)atomic_load(&g_sp_live_n), (unsigned long long)(atomic_load(&g_sp_live_bytes) >> 20), (unsigned long long)atomic_load(&g_sp_created)); }
++    if (gpu) sparse_map_pending(spi, mt);
 +    return mt;
 +}
-+// Maps the tiles of every level and layer that holds mapped pages, in one submission on a classic Metal queue (the Metal 4 queue's updateTextureMappings crashed inside Metal on this OS);
-+//   the tiles come from the texture's own heap. Waits for it, so the uploads that follow find their tiles
++// Maps the tiles of every level and layer that holds mapped pages and has none yet, in one submission on a classic Metal queue (the Metal 4 queue's updateTextureMappings crashed inside
++//   Metal on this OS); the tiles come from the texture's own heap. Waits for it, so the uploads / draws that follow find their tiles
 +static id<MTLCommandQueue> g_qs;
-+static void sparse_map_all(SpInfo *spi, id<MTLTexture> mt, const tex_t *t, MTLTextureDescriptor *d, unsigned layers, uint32_t nl, uint64_t ls) {
++static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt) {
 +    if (!spi || !spi->heap) return;
 +    @autoreleasepool {
-+        if (!g_qs) g_qs = [g_dev newCommandQueue];
-+        if (!g_qs) return;
-+        uint64_t am0 = g_dev.currentAllocatedSize;
-+        id<MTLCommandBuffer> cb = [g_qs commandBuffer]; id<MTLResourceStateCommandEncoder> en = [cb resourceStateCommandEncoder];
-+        if (!en) return;
-+        uint64_t n = 0, tiles_total = 0;
-+        for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
-+            uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u);
-+            for (unsigned y = 0; y < layers; y++) {
-+                uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
-+                if (hi <= lo || hi > t->L.size || !nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo)) continue;
++        uint32_t nl = spi->td.levels ? spi->td.levels : 1;
++        id<MTLCommandBuffer> cb = nil; id<MTLResourceStateCommandEncoder> en = nil;
++        uint64_t n = 0, tiles_total = 0, am0 = g_dev.currentAllocatedSize;
++        for (unsigned l = 0; l < spi->nlev; l++) {
++            uint32_t w = MAX(spi->td.width >> l, 1u), h = MAX(spi->td.height >> l, 1u);
++            for (unsigned y = 0; y < spi->layers; y++) {
++                NSUInteger key = (NSUInteger)l * spi->layers + y; if ([spi->mapped containsIndex:key]) continue;
++                uint64_t lo = (uint64_t)y * spi->lsz + nvn_tex_level_offset(&spi->td, l), hi = l + 1 < nl ? (uint64_t)y * spi->lsz + nvn_tex_level_offset(&spi->td, l + 1) : (uint64_t)(y + 1) * spi->lsz;
++                if (hi <= lo || hi > spi->size || !nvn_sparse_any_mapped(spi->pool, (uint64_t)(uintptr_t)spi->base + lo, hi - lo)) continue;
 +                MTLRegion rg; NSUInteger lvl; uint64_t tiles;
-+                if (l >= spi->tailFirst) { if ([spi->tailDone containsIndex:y]) continue; rg = MTLRegionMake3D(0, 0, 0, spi->tailTiles, 1, 1); lvl = spi->tailFirst; tiles = spi->tailTiles; }
++                if (l >= spi->tailFirst) { if ([spi->tailDone containsIndex:y]) { [spi->mapped addIndex:key]; continue; } rg = MTLRegionMake3D(0, 0, 0, spi->tailTiles, 1, 1); lvl = spi->tailFirst; tiles = spi->tailTiles; }
 +                else { NSUInteger nx = (w + spi->tw - 1) / spi->tw, ny = (h + spi->th - 1) / spi->th; rg = MTLRegionMake3D(0, 0, 0, nx, ny, 1); lvl = l; tiles = (uint64_t)nx * ny; }
-+                if (spi->used + tiles > spi->cap) { static int said_cap; if (!said_cap++) MLOG("【红】 sparse texture ser=%llu: no room left in its heap (%llu of %llu tiles used): the rest stays unmapped (first case)", (unsigned long long)t->serial, (unsigned long long)spi->used, (unsigned long long)spi->cap); goto done; }
++                if (spi->used + tiles > spi->cap) { static int said_cap; if (!said_cap++) MLOG("【红】 sparse texture: no room left in its heap (%llu of %llu tiles used): the rest stays unmapped (first case)", (unsigned long long)spi->used, (unsigned long long)spi->cap); goto done; }
++                if (!en) { if (!g_qs) g_qs = [g_dev newCommandQueue]; if (!g_qs) return; cb = [g_qs commandBuffer]; en = [cb resourceStateCommandEncoder]; if (!en) return; }
 +                if (l >= spi->tailFirst) [spi->tailDone addIndex:y];
-+                if (n < 4) { static int said_u; if (said_u++ < 8) MLOG("[sparse] map level %lu layer %u: region %lux%lux%lu tiles (heap %llu tiles, %llu used)", (unsigned long)lvl, y, (unsigned long)rg.size.width, (unsigned long)rg.size.height, (unsigned long)rg.size.depth, (unsigned long long)spi->cap, (unsigned long long)spi->used); }
 +                [en updateTextureMapping:mt mode:MTLSparseTextureMappingModeMap region:rg mipLevel:lvl slice:y];
-+                spi->used += tiles; tiles_total += tiles; n++;
++                [spi->mapped addIndex:key]; spi->used += tiles; tiles_total += tiles; n++;
 +            }
 +        }
 +    done:
-+        [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
-+        { static int said_a; if (said_a++ < 40) MLOG("[sparse] texture ser=%llu: %llu level-layer mappings, %llu tiles (%llu MB) mapped; device allocation %+lld MB by the mapping, now %llu MB", (unsigned long long)t->serial, (unsigned long long)n, (unsigned long long)tiles_total, (unsigned long long)((tiles_total * spi->tileBytes) >> 20), (long long)((int64_t)(g_dev.currentAllocatedSize - am0) >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20)); }
++        if (en) { [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
++            static int said_a; if (said_a++ < 60) MLOG("[sparse] %s texture: %llu level-layer mappings, %llu tiles (%llu MB) mapped, %llu of %llu tiles used; device allocation %+lld MB by the mapping, now %llu MB", spi->gpu ? "GPU" : "packaged", (unsigned long long)n, (unsigned long long)tiles_total, (unsigned long long)((tiles_total * spi->tileBytes) >> 20), (unsigned long long)spi->used, (unsigned long long)spi->cap, (long long)((int64_t)(g_dev.currentAllocatedSize - am0) >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20)); }
 +    }
++}
++// A GPU sparse texture follows the game's page mapping: when pages were mapped since the last look (and a few frames passed), the new ones get tiles
++static void sparse_sync(SpInfo *spi, id<MTLTexture> mt) {
++    uint64_t g = nvn_sparse_gen(); if (g == spi->gen) return;
++    uint64_t fr = atomic_load(&g_cur_frame); if (spi->frame && fr - spi->frame < 6) return;
++    spi->gen = g; spi->frame = fr;
++    sparse_map_pending(spi, mt);
 +}
  static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, uint64_t **ph, uint32_t *nph) {
      MTLTextureDescriptor *d = tex_desc(t, 1);
@@ -122,15 +138,33 @@ index a72773f..7cf6506 100644
 -    id<MTLTexture> mt = reuse && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
 -                        ? reuse : [g_dev newTextureWithDescriptor:d];
 +    id<MTLTexture> mt = reuse && !reuse.heap && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
-+                        ? reuse : (sparse_create(t, d) ?: [g_dev newTextureWithDescriptor:d]);
++                        ? reuse : (sparse_create(t, d, 0) ?: [g_dev newTextureWithDescriptor:d]);
      if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
      if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
      res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
-@@ -3193,6 +3282,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+@@ -3193,6 +3298,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
          //   Unmapped pages read as zero: a level with no page behind it is simply left as created.
          up_begin();
          uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0;
-+        SpInfo *spi = sp_info(mt); if (spi) sparse_map_all(spi, mt, t, d, layers, nl, ls);
++        SpInfo *spi = sp_info(mt); if (spi) sparse_map_pending(spi, mt);
          for (unsigned l = 0; sp_ok && l < d.mipmapLevelCount; l++) {
              uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
              size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
+@@ -4187,7 +4293,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+         if (stale) { static int nstale; if (nstale++ < 4) MLOG("stale sRGB / linear view dropped ser=%llu format %lu (%d so far)", (unsigned long long)t->serial, (unsigned long)((id<MTLTexture>)have).pixelFormat, nstale);
+             serial_del(t->serial); have = nil; }
+     }
+-    if (have) return have;
++    if (have) { SpInfo *spi_ = sp_info(have); if (spi_ && spi_->gpu) sparse_sync(spi_, have); return have; }
+     if (t->d.target == 10) {   // Buffer texture (TARGET_BUFFER): create the texture-buffer view directly on the memory pool buffer (zero copy; the GPU reads the pool's current content at execution time, same as NVN semantics)
+         uint32_t pf = 0; uint8_t swz[4]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+         void *mb; uint64_t mo;
+@@ -4248,7 +4354,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     if (!mt) {
+         MTLTextureDescriptor *d = tex_desc(t, 0);
+         if (!d) return nil;
+-        mt = [g_dev newTextureWithDescriptor:d];
++        mt = (sparse_gpu_on() ? sparse_create(t, d, 1) : nil) ?: [g_dev newTextureWithDescriptor:d];
+         if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
+         res_add(mt);   // register residency before filling (the copy destination must be resident too)
+         // S2Arm (fork): a very large texture of a sparse (virtual) pool holds nothing yet (Mario Kart World: 61 textures of 8192x8192, about 340 MB each, 144 KB resident): writing zeros over all of it

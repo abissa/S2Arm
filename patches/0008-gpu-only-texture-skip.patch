@@ -1,0 +1,35 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 224c48c..7d2c978 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3082,6 +3082,17 @@ static id<MTLBuffer> up_tex_src(uint64_t addr, uint64_t len, uint64_t *off) {
+     g_up_src_n++; g_up_src_bytes += b - a;
+     return buf;
+ }
++// S2Arm (fork): Switch 2 games map GPU-only (protected) memory with no CPU access; a texture living there must not be read for upload (the host faulted in span_hash: SIGBUS)
++static int guest_mem_readable(const void *p, size_t n) {
++    vm_address_t a = (vm_address_t)(uintptr_t)p, end = a + n;
++    while (a < end) {
++        vm_address_t ra = a; vm_size_t rs = 0; vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
++        if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj) != KERN_SUCCESS) return 0;
++        if (ra > a || !(vi.protection & VM_PROT_READ)) return 0;
++        a = ra + rs;
++    }
++    return 1;
++}
+ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, uint64_t **ph, uint32_t *nph) {
+     MTLTextureDescriptor *d = tex_desc(t, 1);
+     if (!d) return nil;
+@@ -3091,6 +3102,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
+     res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
+     int sparse = t->pool && nvn_sparse_pool(t->pool);
++    if (!sparse && t->mem && t->L.size && !guest_mem_readable(t->mem, t->L.size)) {   // S2Arm (fork): GPU-only memory: nothing to upload, the texture stays as created
++        { static int said_gpu_only; if (!said_gpu_only++) MLOG("【红】 texture ser=%llu storage %p+%#llx is not CPU-readable (GPU-only memory): not uploaded (first case)", (unsigned long long)t->serial, (const void *)t->mem, (unsigned long long)t->L.size); }
++        if (stamp) *stamp = nvn_dirty_now();
++        if (ph) { free(*ph); *ph = NULL; if (nph) *nph = 0; }
++        return mt;
++    }
+     if (stamp) {   // no stamp: a one-time upload of content the CPU will not change (tex_init_fill), with no write tracking
+         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size);
+         *stamp = nvn_dirty_now();

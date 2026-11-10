@@ -1,5 +1,5 @@
 diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
-index f578e00..184f802 100644
+index f578e00..28123a7 100644
 --- a/runtime/src/vawin.c
 +++ b/runtime/src/vawin.c
 @@ -300,7 +300,7 @@ int s2a_process_prewarmed(void) {
@@ -7,7 +7,7 @@ index f578e00..184f802 100644
  #define TL_SMALL (256ull << 20)
  #define MIN_WIN (2ull << 30)
 -#define HOST_BELOW (3ull << 30)   // 放不下标准布局时窗口下方留给宿主的地址（11-06：1 GB → 3 GB。iOS 上宿主可用地址 = 低区约 1.8 GB + 这一段；时之笛 Switch 2 版宿主峰值 1.7–2.1 GB，1 GB 时低区碰底在上屏路径崩。时之笛游戏最高只碰到窗口 +17.6 GB、异度3 碰到 +60.6 GB，3 GB 两者都装得下；≥3712 MB 会让 GC 上限改选分堆档吃掉收益）   // 窗口最少要这么多（模块 + 栈 + 堆前段放得下与否由布局判，layout.c）   // 窗口顶到空洞末尾时只接管这么多（九款尾部峰值 ≤ 202 MB，见 s2a_window_trim）
-+#define HOST_BELOW (6ull << 30)   /* S2Arm (fork): was 3 GiB. Mario Kart World's virtual pools need ~3.4 GB of host address space besides Metal / GC / thread stacks */   // 放不下标准布局时窗口下方留给宿主的地址（11-06：1 GB → 3 GB。iOS 上宿主可用地址 = 低区约 1.8 GB + 这一段；时之笛 Switch 2 版宿主峰值 1.7–2.1 GB，1 GB 时低区碰底在上屏路径崩。时之笛游戏最高只碰到窗口 +17.6 GB、异度3 碰到 +60.6 GB，3 GB 两者都装得下；≥3712 MB 会让 GC 上限改选分堆档吃掉收益）   // 窗口最少要这么多（模块 + 栈 + 堆前段放得下与否由布局判，layout.c）   // 窗口顶到空洞末尾时只接管这么多（九款尾部峰值 ≤ 202 MB，见 s2a_window_trim）
++#define HOST_BELOW (12ull << 30)   /* S2Arm (fork): was 3 GiB. Mario Kart World's virtual pools need ~3.4 GB of host address space besides Metal / GC / thread stacks */   // 放不下标准布局时窗口下方留给宿主的地址（11-06：1 GB → 3 GB。iOS 上宿主可用地址 = 低区约 1.8 GB + 这一段；时之笛 Switch 2 版宿主峰值 1.7–2.1 GB，1 GB 时低区碰底在上屏路径崩。时之笛游戏最高只碰到窗口 +17.6 GB、异度3 碰到 +60.6 GB，3 GB 两者都装得下；≥3712 MB 会让 GC 上限改选分堆档吃掉收益）   // 窗口最少要这么多（模块 + 栈 + 堆前段放得下与否由布局判，layout.c）   // 窗口顶到空洞末尾时只接管这么多（九款尾部峰值 ≤ 202 MB，见 s2a_window_trim）
  static uint64_t g_need, g_fit;   // 本款要的跨度；2^39 以下最大能放的一块（1 GB 对齐后）——自检提示「本款需要 N GB，本机最多 M GB」用
  void s2a_window_need(uint64_t *need, uint64_t *fit) { *need = g_need; *fit = g_fit; }
  static char g_npdm[1100];   // 本款 main.npdm 路径（找不到可执行文件目录 / 模块目录时为空）：跨度算不出时按它说清原因

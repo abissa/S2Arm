@@ -1,0 +1,22 @@
+name: xcode-check
+# Diagnostic only: prints which Xcode / iOS SDK the GitHub macOS runner has, so we know
+# whether S2Arm's iPhone app (needs the iOS 27 SDK) can be built on a free runner.
+on: workflow_dispatch
+
+jobs:
+  check:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: |
+          set +e
+          echo "== macOS"; sw_vers
+          echo "== selected Xcode"; xcode-select -p; xcodebuild -version
+          echo "== installed Xcode apps"; ls -d /Applications/Xcode* 2>/dev/null
+          echo "== iOS SDKs"; xcodebuild -showsdks | grep -i -E "iphoneos|ios"
+          echo "== iphoneos SDK version"; xcrun --sdk iphoneos --show-sdk-version
+          echo "== project toolchain pins"; sed -n '1,40p' tools/toolchain.env
+          echo "== tools"; make --version | head -1; python3 --version; git --version
+          echo "== disk"; df -h / | tail -1

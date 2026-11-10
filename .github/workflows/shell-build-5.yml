@@ -9,10 +9,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 240
     env:
-      S2A_CS_CACHE: ${{ github.workspace }}/../s2cache/cs
-      S2A_VPX_CACHE: ${{ github.workspace }}/../s2cache/vpx
-      S2A_OPUS_CACHE: ${{ github.workspace }}/../s2cache/opus
-      S2A_DAV1D_CACHE: ${{ github.workspace }}/../s2cache/dav1d
+      S2A_CS_CACHE: ${{ github.workspace }}/build/s2cache/cs
+      S2A_VPX_CACHE: ${{ github.workspace }}/build/s2cache/vpx
+      S2A_OPUS_CACHE: ${{ github.workspace }}/build/s2cache/opus
+      S2A_DAV1D_CACHE: ${{ github.workspace }}/build/s2cache/dav1d
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +33,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/../s2cache
             ${{ github.workspace }}/build
             ~/.cache/s2arm-build
             ~/.nuget/packages

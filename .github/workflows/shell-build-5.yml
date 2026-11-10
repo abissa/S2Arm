@@ -2,11 +2,16 @@ name: shell-build-5
 # Experiment: build S2Arm's iPhone app ("shell") on a free GitHub macOS runner.
 # The runner only has the iOS 26.5 SDK, so this run changes the pinned SDK major from 27 to 26
 # (committed locally on the runner only; nothing is pushed back) and then runs pack/shell_build.sh.
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: runner label
+        default: macos-26
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner || 'macos-26' }}
     timeout-minutes: 240
     env:
       S2A_CS_CACHE: ${{ github.workspace }}/build/s2cache/cs

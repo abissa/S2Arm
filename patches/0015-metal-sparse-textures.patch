@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index a72773f..efca96a 100644
+index a72773f..7668bb8 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -297,6 +297,12 @@ static void big_tex_res(id<MTLResource> r, int line) {
@@ -73,7 +73,7 @@ index a72773f..efca96a 100644
 +    if (!mt) { static int said_t; if (!said_t++) MLOG("【红】 sparse texture ser=%llu: cannot create it on its heap (first case): created whole", (unsigned long long)t->serial); return nil; }
 +    SpInfo *spi = [SpInfo new]; spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet];
 +    objc_setAssociatedObject(mt, &g_sp_key, spi, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-+    res_add_heap(hp);
++    if (0) res_add_heap(hp);   // the heap is not put in the residency set: committing the set with sparse heaps in it crashed inside Metal (null object in res_commit)
 +    { static int said_s; if (said_s++ < 12) MLOG("[sparse] texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed for its mapped pages (%llu MB), heap %llu MB",
 +        (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
 +        (unsigned long)tailFirst, (unsigned long)tailTiles, (unsigned long long)need, (unsigned long long)((need * tileBytes) >> 20), (unsigned long long)(bytes >> 20)); }

@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
-index 831fdba..a2fa855 100644
+index 831fdba..3575a66 100644
 --- a/graphics/nvn/gfx/nvn/hle_nvn.c
 +++ b/graphics/nvn/gfx/nvn/hle_nvn.c
 @@ -3856,6 +3856,9 @@ static void *vpool_mmap(uint64_t len) {
@@ -8,7 +8,7 @@ index 831fdba..a2fa855 100644
  }
 +// S2Arm (fork): total address space the virtual pools may reserve at once. Mario Kart World makes many 1 GB pools; unbounded, they ate the whole low region
 +//   (thread stacks then failed: pthread_create EAGAIN). Past the budget a pool gets a small reservation and the rest of it is served by the page table
-+static _Atomic int64_t g_vp_budget = 1024ll << 20;
++static _Atomic int64_t g_vp_budget = 2800ll << 20;
  static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of a virtual pool, NULL when no address space is left
      if (!(o->flags & 0x200)) return NULL;
      // 1 GB on iOS: Monster Hunter Rise's buffers stay under 0x20100000 through its opening, its textures (32 GB in) are read through the page table, and 4 GB guest + 1 GB stays near the 5 GB
@@ -17,7 +17,7 @@ index 831fdba..a2fa855 100644
  #endif
      uint64_t len = o->size < cap ? o->size : cap;
 +    { int64_t left = atomic_load(&g_vp_budget); uint64_t want0 = len;
-+      if ((int64_t)len > left) { len = left > (int64_t)(16ull << 20) ? ((uint64_t)left & ~((2ull << 20) - 1)) : (16ull << 20); if (len > want0) len = want0; }
++      if ((int64_t)len > left) { len = left > (int64_t)(64ull << 20) ? ((uint64_t)left & ~((2ull << 20) - 1)) : (64ull << 20); if (len > want0) len = want0; }
 +      static _Atomic int said; if (len < want0 && atomic_fetch_add(&said, 1) < 3) LOG("[nvn] virtual pool %p: address-space budget left %lld MB, reserving %#llx instead of %#llx", (const void *)o, (long long)(left >> 20), (unsigned long long)len, (unsigned long long)want0); }
      void *a = s2a_vp_arena_map ? s2a_vp_arena_map(len) : NULL;   // 帧录进程：从虚拟池区取，回放进程同址放得回（runtime/src/vawin.c）
      if (!a) a = vpool_mmap(len);

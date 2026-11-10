@@ -1,5 +1,5 @@
 diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
-index f578e00..029d2fd 100644
+index f578e00..18fe1ff 100644
 --- a/runtime/src/vawin.c
 +++ b/runtime/src/vawin.c
 @@ -300,7 +300,38 @@ int s2a_process_prewarmed(void) {
@@ -7,7 +7,7 @@ index f578e00..029d2fd 100644
  #define TL_SMALL (256ull << 20)
  #define MIN_WIN (2ull << 30)
 -#define HOST_BELOW (3ull << 30)   // 放不下标准布局时窗口下方留给宿主的地址（11-06：1 GB → 3 GB。iOS 上宿主可用地址 = 低区约 1.8 GB + 这一段；时之笛 Switch 2 版宿主峰值 1.7–2.1 GB，1 GB 时低区碰底在上屏路径崩。时之笛游戏最高只碰到窗口 +17.6 GB、异度3 碰到 +60.6 GB，3 GB 两者都装得下；≥3712 MB 会让 GC 上限改选分堆档吃掉收益）   // 窗口最少要这么多（模块 + 栈 + 堆前段放得下与否由布局判，layout.c）   // 窗口顶到空洞末尾时只接管这么多（九款尾部峰值 ≤ 202 MB，见 s2a_window_trim）
-+#define HOST_BELOW (12ull << 30)   /* S2Arm (fork): was 3 GiB */
++#define HOST_BELOW (35ull << 30)   /* S2Arm (fork): was 3 GiB */
 +
 +// S2Arm (fork): virtual-pool arena. Mario Kart World makes many 1 GB sparse pools; each used to take whatever hole mmap(NULL) found (scattered through the 2 GB low region), so the big
 +//   ones found no hole and the whole low region ran out (thread stacks, malloc, Metal failed). One contiguous PROT_NONE block is reserved below the window at start-up and pool

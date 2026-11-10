@@ -1,0 +1,41 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 831fdba..a2fa855 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -3856,6 +3856,9 @@ static void *vpool_mmap(uint64_t len) {
+     if (hole && len > hole) { errno = ENOMEM; return MAP_FAILED; }
+     return mmap(NULL, len, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+ }
++// S2Arm (fork): total address space the virtual pools may reserve at once. Mario Kart World makes many 1 GB pools; unbounded, they ate the whole low region
++//   (thread stacks then failed: pthread_create EAGAIN). Past the budget a pool gets a small reservation and the rest of it is served by the page table
++static _Atomic int64_t g_vp_budget = 1024ll << 20;
+ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of a virtual pool, NULL when no address space is left
+     if (!(o->flags & 0x200)) return NULL;
+     // 1 GB on iOS: Monster Hunter Rise's buffers stay under 0x20100000 through its opening, its textures (32 GB in) are read through the page table, and 4 GB guest + 1 GB stays near the 5 GB
+@@ -3867,6 +3870,9 @@ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of
+     { const char *e = getenv("S2A_IPHONE_VA"); if (e && *e == '0') cap = 64ull << 30; }
+ #endif
+     uint64_t len = o->size < cap ? o->size : cap;
++    { int64_t left = atomic_load(&g_vp_budget); uint64_t want0 = len;
++      if ((int64_t)len > left) { len = left > (int64_t)(16ull << 20) ? ((uint64_t)left & ~((2ull << 20) - 1)) : (16ull << 20); if (len > want0) len = want0; }
++      static _Atomic int said; if (len < want0 && atomic_fetch_add(&said, 1) < 3) LOG("[nvn] virtual pool %p: address-space budget left %lld MB, reserving %#llx instead of %#llx", (const void *)o, (long long)(left >> 20), (unsigned long long)len, (unsigned long long)want0); }
+     void *a = s2a_vp_arena_map ? s2a_vp_arena_map(len) : NULL;   // 帧录进程：从虚拟池区取，回放进程同址放得回（runtime/src/vawin.c）
+     if (!a) a = vpool_mmap(len);
+     // 占不到就逐次减半（按 2 MB 页表粒度取整）再占，直到 16 MB：超出预留的映射走「超出预留、只进页表」那支，预留内的地址照常换得回宿主地址
+@@ -3875,6 +3881,7 @@ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of
+         while (a == MAP_FAILED && len > (16ull << 20)) { len = (len >> 1) & ~((2ull << 20) - 1); a = vpool_mmap(len); }
+         if (a != MAP_FAILED) LOG("[nvn] virtual pool %p: %#llx bytes of address space not available (errno %d), reserving %#llx instead", (const void *)o, (unsigned long long)want, er, (unsigned long long)len); }
+     if (a == MAP_FAILED) { LOG("【红】 virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
++    atomic_fetch_sub(&g_vp_budget, (int64_t)len);
+     vpool_new(o, a, len); vp_lock(); size_t live = g_nvpa; vp_unlock();
+     static _Atomic uint64_t n; uint64_t k = atomic_fetch_add(&n, 1) + 1;   // a UE4 game makes one per streamed texture: the first ones and every 1000th
+     if (k <= 8 || k % 1000 == 0) LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): own address range %p+%#llx, physical pages are remapped into it (%llu so far, %zu alive)", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len, (unsigned long long)k, live);
+@@ -3883,7 +3890,7 @@ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of
+ static void vpool_release(const pool_t *o) {
+     vp_lock(); struct vpool *v = vpool_of(o);
+     if (v) { vpool_unpublish(v);
+-        for (int k = 0; k < v->nrun; k++) nvn_be_pool_del(v->base + v->run[k].lo); vpool_unmap_range(v->base, v->len);
++        for (int k = 0; k < v->nrun; k++) nvn_be_pool_del(v->base + v->run[k].lo); vpool_unmap_range(v->base, v->len); atomic_fetch_add(&g_vp_budget, (int64_t)v->len);
+ #if defined(__ANDROID__)
+         // 拆池必须早于 s2a_mem_session_reset：祖先先是 vpool_release 再 reset，否则 unref 会下溢。
+         s2a_vp_alias_clear(&v->alias);

@@ -1,0 +1,26 @@
+diff --git a/compat/tree/src/Ryujinx.HLE/S2AHooks.cs b/compat/tree/src/Ryujinx.HLE/S2AHooks.cs
+index 69b1aee..feb15c8 100644
+--- a/compat/tree/src/Ryujinx.HLE/S2AHooks.cs
++++ b/compat/tree/src/Ryujinx.HLE/S2AHooks.cs
+@@ -14,6 +14,9 @@ namespace Ryujinx.HLE
+         // 游戏是 Switch 2 程序（NPDM 是 Switch 2 的 ACID 布局；services Application.Register 按 NpdmCompat 设）。只给语义随机型变的命令分派用
+         public static bool Switch2;
+ 
++        // S2Arm (fork): the running game's program id (set by services Application.Register); 0 = not registered yet
++        public static ulong ProgramId;
++
+         // GetDesiredLanguage when the game does not support the system language: try these in order before upstream's "first supported"
+         // (the host passes the system's preferred languages, then Simplified / Traditional Chinese, then English). Null = upstream.
+         public static Ryujinx.HLE.HOS.SystemState.TitleLanguage[] TitleLanguageFallback;
+diff --git a/services/S2A.Services/Application.cs b/services/S2A.Services/Application.cs
+index f90fd3a..9b91bba 100644
+--- a/services/S2A.Services/Application.cs
++++ b/services/S2A.Services/Application.cs
+@@ -67,6 +67,7 @@ namespace S2A.Services
+             metaLoader.Load(npdmBytes).ThrowIfFailure();
+             metaLoader.GetNpdm(out Npdm npdm).ThrowIfFailure();
+             ProgramId = npdm.Aci.ProgramId.Value;
++            Ryujinx.HLE.S2AHooks.ProgramId = ProgramId;
+             if (requireSuccess && ProgramId != Native.ProgramId())
+                 throw new InvalidOperationException("Application NPDM and native process program IDs disagree");
+             if ((int)(ProgramId & 0xF) != programIndex)

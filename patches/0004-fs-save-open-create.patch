@@ -1,0 +1,33 @@
+diff --git a/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs b/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs
+index 03b5193..29153e7 100644
+--- a/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs
++++ b/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs
+@@ -367,6 +367,28 @@ namespace Ryujinx.HLE.HOS.Services.Fs
+ 
+             Result result = S2ASaveShare.OpenShared(key, ref fileSystem.Ref, (ref SharedRef<IFileSystem> fs) => _baseFileSystemProxy.Get.OpenSaveDataFileSystem(ref fs, spaceId, in attribute));
+             if (result.IsFailure())
++            {
++                // S2Arm (fork): Switch 2 games may open a save the NACP did not create. Log what was asked; if it does not exist, create it and retry once.
++                Console.Error.WriteLine($"[fs-save] OpenSaveDataFileSystem failed {result.Value:X}: space={spaceId} type={attribute.Type} program={attribute.ProgramId.Value:X16} index={attribute.Index} rank={attribute.Rank} static={attribute.StaticSaveDataId:X16}");
++                if (ResultFs.TargetNotFound.Includes(result))
++                {
++                    SaveDataCreationInfo ci = default;
++                    ci.Size = 0x4000000;
++                    ci.JournalSize = 0x1000000;
++                    ci.BlockSize = 0x4000;
++                    ci.OwnerId = attribute.ProgramId.Value;
++                    ci.SpaceId = spaceId;
++                    SaveDataMetaInfo mi = default;
++                    Result cr = _baseFileSystemProxy.Get.CreateSaveDataFileSystem(in attribute, in ci, in mi);
++                    Console.Error.WriteLine($"[fs-save] created missing save: {cr.Value:X}");
++                    if (cr.IsSuccess())
++                    {
++                        result = S2ASaveShare.OpenShared(key, ref fileSystem.Ref, (ref SharedRef<IFileSystem> fs) => _baseFileSystemProxy.Get.OpenSaveDataFileSystem(ref fs, spaceId, in attribute));
++                        Console.Error.WriteLine($"[fs-save] reopen: {result.Value:X}");
++                    }
++                }
++            }
++            if (result.IsFailure())
+             {
+                 return (ResultCode)result.Value;
+             }

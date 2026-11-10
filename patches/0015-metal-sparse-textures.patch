@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index a72773f..c31ef8b 100644
+index a72773f..4fe6ec9 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -297,6 +297,12 @@ static void big_tex_res(id<MTLResource> r, int line) {
@@ -31,10 +31,14 @@ index a72773f..c31ef8b 100644
      if (g_m3 && [r conformsToProtocol:@protocol(MTLBuffer)]) m3_buf_del((id<MTLBuffer>)r);
      g_res_dirty = 1; g_rs_rm++;
      pthread_mutex_unlock(&g_res_mu);
-@@ -3109,11 +3117,52 @@ static void big_free(void *p, size_t n) {
+@@ -3109,11 +3117,75 @@ static void big_free(void *p, size_t n) {
      size_t r = (n + 16383) & ~(size_t)16383;
      if (s2a_vp_arena_has && s2a_vp_arena_has(p, r)) { mmap(p, r, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); s2a_vp_arena_free(p, r); } else free(p);
  }
++static id<MTLHeap> sp_heap(NSUInteger bytes) {
++    MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked; hd.size = bytes;
++    return [g_dev newHeapWithDescriptor:hd];
++}
 +static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d) {   // nil = not a texture for this (create it whole, as before)
 +    if (!g_q4 || !g_dev || !t->pool || !nvn_sparse_pool(t->pool)) return nil;
 +    if (d.textureType != MTLTextureType2D && d.textureType != MTLTextureType2DArray) return nil;
@@ -45,16 +49,34 @@ index a72773f..c31ef8b 100644
 +    NSUInteger tileBytes = g_dev.sparseTileSizeInBytes; if (!tileBytes) return nil;
 +    MTLSize ts = [g_dev sparseTileSizeWithTextureType:d.textureType pixelFormat:d.pixelFormat sampleCount:1];
 +    if (!ts.width || !ts.height) return nil;
-+    MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
-+    hd.size = (NSUInteger)(4u << 20);
-+    id<MTLHeap> h0 = [g_dev newHeapWithDescriptor:hd]; if (!h0) { static int said_h; if (!said_h++) MLOG("【红】 sparse texture: cannot create a sparse heap (first case): texture created whole"); return nil; }
 +    MTLTextureDescriptor *sd = [d copy]; sd.storageMode = MTLStorageModePrivate; sd.hazardTrackingMode = MTLHazardTrackingModeUntracked; sd.allowGPUOptimizedContents = NO;
-+    id<MTLTexture> mt = [h0 newTextureWithDescriptor:sd];
-+    if (!mt) { static int said_t; if (!said_t++) MLOG("【红】 sparse texture ser=%llu %lux%lu format %lu: cannot create it on a sparse heap (first case): created whole", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat); return nil; }
-+    SpInfo *spi = [SpInfo new]; spi->heap0 = h0; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = mt.firstMipmapInTail; spi->tailTiles = (mt.tailSizeInBytes + tileBytes - 1) / tileBytes; spi->tailDone = [NSMutableIndexSet indexSet];
++    // a throwaway sparse texture tells where the mip tail starts and how big it is
++    NSUInteger tailFirst = 0, tailTiles = 0;
++    { id<MTLHeap> hq = sp_heap(1u << 20); id<MTLTexture> q = hq ? [hq newTextureWithDescriptor:sd] : nil;
++      if (!q) { static int said_q; if (!said_q++) MLOG("【红】 sparse texture ser=%llu %lux%lu format %lu: cannot create a sparse texture (first case): created whole", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat); return nil; }
++      tailFirst = q.firstMipmapInTail; tailTiles = (q.tailSizeInBytes + tileBytes - 1) / tileBytes; }
++    // tiles for the level-layers that hold mapped pages now (a level's mip tail counts once per layer)
++    uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; unsigned layers = tex_layers(t);
++    uint64_t need = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
++    for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
++        uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u);
++        for (unsigned y = 0; y < layers; y++) {
++            uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
++            if (hi <= lo || hi > t->L.size || !nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo)) continue;
++            if (l >= tailFirst) { if (![tl containsIndex:y]) { [tl addIndex:y]; need += tailTiles; } }
++            else need += (uint64_t)((w + ts.width - 1) / ts.width) * ((h + ts.height - 1) / ts.height);
++        }
++    }
++    uint64_t bytes = (need + need / 8 + 64) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // a little slack, whole MB
++    id<MTLHeap> hp = sp_heap((NSUInteger)bytes); if (!hp) { static int said_h; if (!said_h++) MLOG("【红】 sparse texture: cannot create a %llu MB sparse heap (first case): texture created whole", (unsigned long long)(bytes >> 20)); return nil; }
++    id<MTLTexture> mt = [hp newTextureWithDescriptor:sd];
++    if (!mt) { static int said_t; if (!said_t++) MLOG("【红】 sparse texture ser=%llu: cannot create it on its heap (first case): created whole", (unsigned long long)t->serial); return nil; }
++    SpInfo *spi = [SpInfo new]; spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet];
 +    objc_setAssociatedObject(mt, &g_sp_key, spi, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-+    res_add_heap(h0);
-+    { static int said_s; if (said_s++ < 12) MLOG("[sparse] texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles)", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes, (unsigned long)spi->tailFirst, (unsigned long)spi->tailTiles); }
++    res_add_heap(hp);
++    { static int said_s; if (said_s++ < 12) MLOG("[sparse] texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed for its mapped pages (%llu MB), heap %llu MB",
++        (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
++        (unsigned long)tailFirst, (unsigned long)tailTiles, (unsigned long long)need, (unsigned long long)((need * tileBytes) >> 20), (unsigned long long)(bytes >> 20)); }
 +    return mt;
 +}
 +// Memory for the tiles of one level and layer (or the mip tail of the layer, once); 0 = no room left in the mapping heap
@@ -73,6 +95,7 @@ index a72773f..c31ef8b 100644
 +        op.textureRegion = MTLRegionMake3D(0, 0, 0, nx, ny, 1); op.textureLevel = l;
 +    }
 +    op.mode = MTLSparseTextureMappingModeMap; op.textureSlice = y; op.heapOffset = spi->used; spi->used += tiles;
++    { static int said_u; if (said_u++ < 6) MLOG("[sparse] map level %u layer %u: region %lux%lux%lu tiles from heap offset %llu (heap %llu tiles)", l, y, (unsigned long)op.textureRegion.size.width, (unsigned long)op.textureRegion.size.height, (unsigned long)op.textureRegion.size.depth, (unsigned long long)op.heapOffset, (unsigned long long)spi->cap); }
 +    [g_q4 updateTextureMappings:mt heap:spi->heap operations:&op count:1];
 +    return 1;
 +}
@@ -86,28 +109,11 @@ index a72773f..c31ef8b 100644
      if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
      if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
      res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
-@@ -3193,12 +3242,31 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+@@ -3193,12 +3265,14 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
          //   Unmapped pages read as zero: a level with no page behind it is simply left as created.
          up_begin();
          uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0;
 +        SpInfo *spi = sp_info(mt);
-+        if (spi && !spi->heap) {   // tiles needed: the level-layers that hold mapped pages (a level's mip tail counts once per layer)
-+            uint64_t need = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
-+            for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
-+                uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u);
-+                for (unsigned y = 0; y < layers; y++) {
-+                    uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
-+                    if (hi <= lo || hi > t->L.size || !nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo)) continue;
-+                    if (l >= spi->tailFirst) { if (![tl containsIndex:y]) { [tl addIndex:y]; need += spi->tailTiles; } }
-+                    else need += (uint64_t)((w + spi->tw - 1) / spi->tw) * ((h + spi->th - 1) / spi->th);
-+                }
-+            }
-+            MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
-+            uint64_t bytes = (need + need / 8 + 64) * spi->tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // a little slack, whole MB
-+            hd.size = (NSUInteger)bytes; spi->heap = [g_dev newHeapWithDescriptor:hd];
-+            if (spi->heap) { spi->cap = bytes / spi->tileBytes; res_add_heap(spi->heap); }
-+            { static int said_p; if (said_p++ < 12) MLOG("[sparse] texture ser=%llu: %llu tiles needed for its mapped pages (%llu MB of tiles), mapping heap %s", (unsigned long long)t->serial, (unsigned long long)need, (unsigned long long)((need * spi->tileBytes) >> 20), spi->heap ? "created" : "FAILED"); }
-+        }
          for (unsigned l = 0; sp_ok && l < d.mipmapLevelCount; l++) {
              uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
              size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;

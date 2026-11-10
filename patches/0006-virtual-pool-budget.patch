@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
-index 831fdba..3575a66 100644
+index 831fdba..0a4ecb0 100644
 --- a/graphics/nvn/gfx/nvn/hle_nvn.c
 +++ b/graphics/nvn/gfx/nvn/hle_nvn.c
 @@ -3856,6 +3856,9 @@ static void *vpool_mmap(uint64_t len) {
@@ -8,7 +8,7 @@ index 831fdba..3575a66 100644
  }
 +// S2Arm (fork): total address space the virtual pools may reserve at once. Mario Kart World makes many 1 GB pools; unbounded, they ate the whole low region
 +//   (thread stacks then failed: pthread_create EAGAIN). Past the budget a pool gets a small reservation and the rest of it is served by the page table
-+static _Atomic int64_t g_vp_budget = 2800ll << 20;
++static _Atomic int64_t g_vp_budget = 4500ll << 20;
  static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of a virtual pool, NULL when no address space is left
      if (!(o->flags & 0x200)) return NULL;
      // 1 GB on iOS: Monster Hunter Rise's buffers stay under 0x20100000 through its opening, its textures (32 GB in) are read through the page table, and 4 GB guest + 1 GB stays near the 5 GB

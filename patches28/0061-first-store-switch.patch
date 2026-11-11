@@ -1,0 +1,16 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 26992bc..1657b4d 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -14348,7 +14348,10 @@ static void dispatch(const p_dispatch *dp) {
+     //   implementation, MIT, c8521eeb / e07cba1c), as Apple's GPUs start workgroups in no order. The host makes it here, in order before this dispatch; an empty dispatch makes none.
+     //   A slot not bound, a word past the binding's size, or an address in no pool is skipped
+     for (int k_ = 0; k_ < 5; k_++) if (!strncmp(cs->key, g_dg_key[k_], 16)) { g_dg_n[k_]++; g_dg_first[k_] += (dp->ind || (dp->x && dp->y && dp->z)) ? (uint64_t)cs->rf.nfirst : 0; g_dg_empty[k_] += !(dp->ind || (dp->x && dp->y && dp->z)); g_dg_ind[k_] += dp->ind != 0; if (!dp->ind) { g_dg_x[k_] = dp->x; g_dg_y[k_] = dp->y; g_dg_z[k_] = dp->z; } }   // S2Arm (fork) diag
+-    if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) {
++    // S2Arm (fork) experiment: S2A_FS_MODE=noind skips the host's first-invocation stores for indirect dispatches (whose GPU-side group count may be zero), =none for every dispatch. Default: as before
++    static int fs_mode = -1; if (fs_mode < 0) { const char *e_ = getenv("S2A_FS_MODE"); fs_mode = e_ && !strcmp(e_, "none") ? 2 : e_ && !strcmp(e_, "noind") ? 1 : 0; if (fs_mode) MLOG("first-invocation stores of compute dispatches: mode %s", fs_mode == 2 ? "none" : "noind"); }
++    if (fs_mode == 2 || (fs_mode == 1 && dp->ind)) { static uint64_t skipped_; if (cs->rf.nfirst && (skipped_++ % 600) == 0) MLOG("first-invocation stores of shader %s skipped (%llu dispatches so far)", cs->key, (unsigned long long)skipped_); }
++    else if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) {
+         const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg]; uint64_t at = 4ull * cs->rf.first[i].word; void *fb; uint64_t fo;
+         if (!u->addr || (u->size && at + 4 > u->size) || !nvn_be_addr(u->addr + at, 4, &fb, &fo)) { RED_ONCE(171, "first-invocation store of shader %s to storage slot %d word %u skipped: the slot is unbound, too small or in no pool", cs->key, cs->rf.first[i].reg, cs->rf.first[i].word); continue; }
+         mtl_sub_fill(u->addr + at, 4, cs->rf.first[i].value);

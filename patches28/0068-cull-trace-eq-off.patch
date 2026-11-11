@@ -1,0 +1,33 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 4d20b43..2d9f3f2 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -9423,8 +9423,8 @@ int nvn_pso_harvest(const char *dir) {
+ }
+ // S2Arm (fork): a depth pre-pass followed by a colour pass that tests depth for EQUAL (Mario Kart World's scenery: depth LESS with no colour, then EQUAL with no depth write; nxnative "Position invariance across shaders").
+ //   Maxwell computes identical position math identically; the translated shaders do not always (the mesh stage's position is not [[invariant]]), so fragments that miss EQUAL by a hair drop out and flicker. EQUAL becomes
+-//   LESS-EQUAL with a small bias toward the camera (S2A_EQ_BIAS depth steps, default 16, 0 = off): a surface that does not match the pre-pass by more than that still fails, as it did with EQUAL
+-static float eq_bias(void) { static float v = -1; if (v < 0) { const char *e = getenv("S2A_EQ_BIAS"); v = e && *e ? (float)atof(e) : 16.0f; if (v > 0) MLOG("depth EQUAL passes: LESS-EQUAL with a bias of %.0f depth steps (S2A_EQ_BIAS)", v); } return v; }
++//   LESS-EQUAL with a small bias toward the camera (S2A_EQ_BIAS depth steps, default 0 = off for now): a surface that does not match the pre-pass by more than that still fails, as it did with EQUAL
++static float eq_bias(void) { static float v = -1; if (v < 0) { const char *e = getenv("S2A_EQ_BIAS"); v = e && *e ? (float)atof(e) : 0.0f; if (v > 0) MLOG("depth EQUAL passes: LESS-EQUAL with a bias of %.0f depth steps (S2A_EQ_BIAS)", v); } return v; }
+ static int eq_draw(void) { return S.ds.dt && S.ds.df == 3 && eq_bias() > 0; }
+ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
+     struct { ds_st ds; uint32_t vm[2], wm[2]; int hd, hs; } k;
+@@ -14362,6 +14362,17 @@ static void dispatch(const p_dispatch *dp) {
+         if (k_ >= 0 && !shown_[k_]++) for (int i = 0; i < cs->rf.nfirst; i++) { const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg];
+             MLOG("[first-store] shader %s store %d of %d: storage slot %d word %u value %#x (binding %s, address %#llx, size %u); dispatch %s %dx%dx%d", cs->key, i + 1, (int)cs->rf.nfirst, cs->rf.first[i].reg, cs->rf.first[i].word, (unsigned)cs->rf.first[i].value,
+                  u->addr ? "bound" : "unbound", (unsigned long long)u->addr, (unsigned)u->size, dp->ind ? "indirect" : "direct", dp->x, dp->y, dp->z); } }   // S2Arm (fork) diag: what each host-made first-invocation store writes, once per shader
++    // S2Arm (fork) S2A_CULL_TRACE=<n>: the first n dispatches of the scenery culling pair (e04783bda5a52269, 2ce9071c2f22d74f): frame, indirect arguments and the first words of each bound storage buffer, read from CPU memory as the GPU left
++    //   them (frames behind). A count that jumps between frames with the camera still is the flicker
++    { static int tr_ = -1; if (tr_ < 0) { const char *e_ = getenv("S2A_CULL_TRACE"); tr_ = e_ && *e_ ? atoi(e_) : 0; }
++      if (tr_ > 0 && (!strncmp(cs->key, "e04783bda5a52269", 16) || !strncmp(cs->key, "2ce9071c2f22d74f", 16))) { static int n_; if (n_++ < tr_) {
++          char b_[640]; int o_ = 0; uint32_t a_[4] = {0xdead, 0xdead, 0xdead, 0xdead}; void *fb_; uint64_t fo_;
++          if (dp->ind && nvn_be_addr(dp->ind, 16, &fb_, &fo_)) { id<MTLBuffer> mb_ = (__bridge id<MTLBuffer>)fb_; if (mb_.contents) memcpy(a_, (uint8_t *)mb_.contents + fo_, 16); }
++          for (int r_ = 0; r_ < 6 && o_ < 560; r_++) { const p_bind_buf *q_ = &S.ssbo[5][r_]; uint32_t w_[4] = {0xdead, 0xdead, 0xdead, 0xdead};
++              if (q_->addr && nvn_be_addr(q_->addr, 16, &fb_, &fo_)) { id<MTLBuffer> mb_ = (__bridge id<MTLBuffer>)fb_; if (mb_.contents) memcpy(w_, (uint8_t *)mb_.contents + fo_, 16); }
++              if (q_->addr) o_ += snprintf(b_ + o_, sizeof b_ - o_, " s%d[%u]=%x,%x,%x,%x", r_, (unsigned)q_->size, w_[0], w_[1], w_[2], w_[3]); }
++          b_[o_ < (int)sizeof b_ ? o_ : (int)sizeof b_ - 1] = 0;
++          MLOG("[cull-trace] frame %llu %.4s #%d dispatch %s ind %x,%x,%x,%x |%s", (unsigned long long)atomic_load(&g_cur_frame), cs->key, n_, dp->ind ? "indirect" : "direct", a_[0], a_[1], a_[2], a_[3], b_); } } }
+     if (fs_mode == 2 || (fs_mode == 1 && dp->ind)) { static uint64_t skipped_; if (cs->rf.nfirst && (skipped_++ % 600) == 0) MLOG("first-invocation stores of shader %s skipped (%llu dispatches so far)", cs->key, (unsigned long long)skipped_); }
+     else if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) {
+         const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg]; uint64_t at = 4ull * cs->rf.first[i].word; void *fb; uint64_t fo;

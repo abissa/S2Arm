@@ -1,0 +1,15 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 392781e..b314eab 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -2732,6 +2732,10 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
+     // 按 NVN 跨队列事件顺序回放（nvn_mtl.m nvn_xqueue.inc）：等别的队列还没回放的信号时，这条队列余下的命令停住，信号回放后再接着回放；每段回放前走 nvn_hle_queue_enter / nvn_hle_piece_begun
+     nvn_be_submit(q, (const uint64_t *)h, n);
+     pthread_mutex_unlock(&g_sub_mu);
++    // S2Arm (fork) S2A_SUBMIT_WAIT=1: the game's thread waits for the GPU after every submission (as nvnQueueFinish does). A game that reads GPU-written data on the CPU a frame or two later (its visibility lists) relies on the GPU being done by then;
++    //   with the GPU running behind the CPU it reads the data half written, and its draw lists change from frame to frame with a still camera
++    { static int sw_ = -1; if (sw_ < 0) { const char *e_ = getenv("S2A_SUBMIT_WAIT"); sw_ = e_ && atoi(e_) > 0; if (sw_) LOG("[nvn] S2A_SUBMIT_WAIT=1: the game's thread waits for the GPU after every submission"); }
++      if (sw_ && !dm_gfx_session_stopping()) { xq_lock(); nvn_be_xq_flush(q, "S2A_SUBMIT_WAIT"); xq_unlock(); queue_finish(); } }
+     uint64_t dw = now_ns() - t0;
+     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
+     uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;

@@ -1,0 +1,43 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 2c05579..3c5914d 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3234,6 +3234,11 @@ static void big_free(void *p, size_t n) {
+     size_t r = (n + 16383) & ~(size_t)16383;
+     if (s2a_vp_arena_has && s2a_vp_arena_has(p, r)) { mmap(p, r, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); s2a_vp_arena_free(p, r); } else free(p);
+ }
++// S2Arm (fork): sparse textures in a virtual pool the CPU cannot access (CPU_NO_ACCESS: Mario Kart World's 8192x8192x68 terrain arrays, pool flags 0x2a1) hold nothing the CPU wrote: every
++//   guest word behind them was zero (0 of 17 - 67 million non-zero), so uploading them from guest memory gave all-zero blocks (ASTC decodes one as magenta) and every re-upload wiped what the GPU had
++//   written. With S2A_VT_GPU=1 they are GPU textures instead: sparse, tiles mapped as the game maps pages (every frame), filled only by the GPU's own copies and draws
++static int vt_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_VT_GPU"); v = e && *e && strcmp(e, "0"); } return v; }
++static int vt_cna(const tex_t *t) { return vt_gpu_on() && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER; }
+ static int sparse_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_SPARSE_GPU"); v = e && *e && strcmp(e, "0"); } return v; }   // render-target textures of sparse pools as sparse textures too (S2A_SPARSE_GPU=1)
+ static id<MTLHeap> sp_heap(NSUInteger bytes) {
+     MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked; hd.size = bytes;
+@@ -3349,7 +3354,7 @@ static int sparse_incr_ok(id<MTLTexture> mt, const tex_t *t) {
+ // A GPU sparse texture follows the game's page mapping: when pages were mapped since the last look (and a few frames passed), the new ones get tiles
+ static void sparse_sync(SpInfo *spi, id<MTLTexture> mt) {
+     uint64_t g = nvn_sparse_gen(); if (g == spi->gen) return;
+-    uint64_t fr = atomic_load(&g_cur_frame); if (spi->frame && fr - spi->frame < 6) return;
++    uint64_t fr = atomic_load(&g_cur_frame); if (spi->frame && fr - spi->frame < (vt_gpu_on() ? 1 : 6)) return;
+     spi->gen = g; spi->frame = fr;
+     sparse_map_pending(spi, mt);
+ }
+@@ -4417,7 +4422,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
+     // A sampled texture in a sparse virtual pool holds what the CPU wrote into the physical pages mapped there (Monster Hunter Rise: the hunter's innerwear, ASTC 6x6 with no packaged
+     // layout, came out magenta, and the face black): it is read through the page table like a packaged one. Render targets, images, linear and buffer textures stay GPU textures (as ft_add)
+-    int packaged = (t->has_layout || tex_cpu_written(t->serial) || (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && t->d.target != NVN_TEXTURE_TARGET_BUFFER
++    int packaged = (t->has_layout || tex_cpu_written(t->serial) || (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && t->d.target != NVN_TEXTURE_TARGET_BUFFER && !vt_cna(t)
+                     && !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE)) && nvn_sparse_pool(t->pool))) && t->mem;
+     {   // Diagnostic DM_NVN_TEXINFO=WxH: log storage and description of textures of that size on first resolution (to tell whether two textures share storage and why they were not merged).
+         //   DM_NVN_TEXINFO=any (or 0x0) drops the size filter: every texture is logged, all=1 on the line
+@@ -4595,7 +4600,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     if (!mt) {
+         MTLTextureDescriptor *d = tex_desc(t, 0);
+         if (!d) return nil;
+-        mt = (sparse_gpu_on() ? sparse_create(t, d, 1) : nil) ?: [g_dev newTextureWithDescriptor:d];
++        mt = ((sparse_gpu_on() || vt_cna(t)) ? sparse_create(t, d, 1) : nil) ?: [g_dev newTextureWithDescriptor:d];
+         if (!mt) { RED_ONCE(2, "failed to create MTLTexture ser=%llu %ux%u format %#x target %d samples %d levels %u", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, t->d.samples, t->d.levels); return nil; }
+         res_add(mt);   // register residency before filling (the copy destination must be resident too)
+         // S2Arm (fork): a very large texture of a sparse (virtual) pool holds nothing yet (Mario Kart World: 61 textures of 8192x8192, about 340 MB each, 144 KB resident): writing zeros over all of it

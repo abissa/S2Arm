@@ -1,0 +1,18 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index ed4a65c..0cc556c 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4025,6 +4025,13 @@ static void phs_note(struct vpool *v, uint64_t voff, uint64_t size, const uint8_
+         if (!have) { int i = s->n < PHS_E ? s->n++ : s->next++ % PHS_E; s->e[i].pool = v->pool; s->e[i].va = va; }
+     }
+ }
++// S2Arm (fork): which 64 KB chunks of [a, a+n) have memory behind them: bit i of bits is the chunk at a + i * 64 KB (its first page); returns how many
++uint64_t nvn_sparse_chunks(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
++    uint64_t c = 0; vp_lock(); struct vpool *v = vpool_at(pool, a);
++    if (v) { uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
++        for (uint64_t i = 0; i * 0x10000 < n; i++) { uint64_t o = (o0 + i * 0x10000) & ~0xFFFull; const vpte *e = o < v->size ? vpt_get(v, o) : NULL; if (e && e->phys) { bits[i >> 3] |= (uint8_t)(1u << (i & 7)); c++; } } }
++    vp_unlock(); return c;
++}
+ // S2Arm (fork): the other places (virtual addresses) that map the physical memory behind va now; up to max of them
+ int nvn_sparse_places(const void *pool, const uint8_t *va, const uint8_t **out, int max) {
+     int n = 0; vp_lock();

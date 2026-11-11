@@ -1,0 +1,13 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 7b09b68..b0e76c6 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4406,7 +4406,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
+                 if (pk->sparse) sparse_view(pk, t);
+                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
+-                if (old != nt) { pk->spare = old; pk->spare_fence = g_fence + 1; } g_ser_gen++; pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); }
++                if (old != nt) { if (pk->sparse) defer_obj_release(old); else { pk->spare = old; pk->spare_fence = g_fence + 1; } } g_ser_gen++;   /* S2Arm (fork): a retired sparse texture is never reused (see sparse_create) and its mapped tiles hold real memory + device allocation: 3.5 GB of dead heaps were alive when Mario Kart World's 31600 array was rebuilt (the build then failed a 64 MB allocation and the process died); it goes as soon as the GPU is done with it */ pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = nvn_dirty_now(); g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); }
+             return pk->view ? pk->view : pk->tex;
+         }
+         pk = [NvPkg new];

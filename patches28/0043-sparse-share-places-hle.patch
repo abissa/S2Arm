@@ -1,0 +1,47 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index d9894ec..3ca9489 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4008,6 +4008,34 @@ int nvn_sparse_shadow(uint64_t a, uint64_t n, uint64_t want) {   // Metal backen
+     if (v && a < (uint64_t)(uintptr_t)v->base + v->len) ok = vsh_cover(v, a - (uint64_t)(uintptr_t)v->base, n, want);
+     vp_unlock(); return ok;
+ }
++// S2Arm (fork): physical pages mapped at several places. Mario Kart World copies its terrain data on the GPU into one set of sparse arrays (31602 - 31604) and maps the same physical pages into
++//   the arrays it samples (31599 - 31601): on the console that is one memory, here each texture has its own tiles, so the sampled arrays stayed empty (magenta / black terrain). Each 64 KB chunk of
++//   physical memory remembers the places it is mapped at; a new place is told the place that already shows it (nvn_be_sparse_share copies the texels on the GPU). S2A_VT_SHARE=0 turns it off
++void nvn_be_sparse_share(const uint8_t *src, const uint8_t *dst, uint64_t n) __attribute__((weak));
++static struct vpool *vpool_at(const void *pool, uint64_t a);
++enum { PHS_N = 1 << 17, PHS_E = 4 };
++static struct phs { const uint8_t *phys; uint8_t n, next; struct { const void *pool; const uint8_t *va; } e[PHS_E]; } *g_phs;
++static void phs_note(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t *phys) {   // caller holds g_vp_mu
++    static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_SHARE"); on = !(e && !strcmp(e, "0")); }
++    if (!on || !phys || !nvn_be_sparse_share || !v->pool || !(v->pool->flags & 0x1)) return;
++    if (!g_phs && !(g_phs = calloc(PHS_N, sizeof *g_phs))) return;
++    for (uint64_t c = 0; c + 0x10000 <= size; c += 0x10000) {
++        const uint8_t *key = phys + c, *va = v->base + voff + c;
++        uint32_t h = (uint32_t)(((uintptr_t)key >> 16) * 0x9E3779B1u) & (PHS_N - 1); struct phs *s = NULL;
++        for (int p = 0; p < 64 && !s; p++) { struct phs *q = &g_phs[(h + (uint32_t)p) & (PHS_N - 1)]; if (q->phys == key || !q->phys) s = q; }
++        if (!s) continue;
++        s->phys = key; int have = 0; const uint8_t *from = NULL;
++        for (int i = 0; i < s->n; i++) {
++            if (s->e[i].va == va) { have = 1; continue; }
++            if (from) continue;
++            struct vpool *o = vpool_at(s->e[i].pool, (uint64_t)(uintptr_t)s->e[i].va);
++            if (!o || s->e[i].va < o->base) continue;
++            const vpte *pe = vpt_get(o, (uint64_t)(s->e[i].va - o->base)); if (pe && pe->phys == key) from = s->e[i].va;
++        }
++        if (from) nvn_be_sparse_share(from, va, 0x10000);
++        if (!have) { int i = s->n < PHS_E ? s->n++ : s->next++ % PHS_E; s->e[i].pool = v->pool; s->e[i].va = va; }
++    }
++}
+ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp_mu; → 0 on failure
+     uint64_t pg = (uint64_t)getpagesize();
+     if (r->voff < 0 || (uint64_t)r->voff + r->size > v->size) { LOG("【红】 virtual pool %p: request at %#llx+%#llx is beyond the pool's %#llx", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)v->size); return 0; }
+@@ -4028,6 +4056,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
+             (const void *)v->pool, v->pool->flags, (unsigned long long)r->voff, (unsigned long long)r->size, (const void *)ph, ph->flags, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, new_ ? " (new pool)" : "", (unsigned long long)nz, (unsigned long long)(tot / 8), (unsigned long long)maps_, (unsigned long long)nzmaps_, g_tpn); }
+     if (ph && (!ph->mem || r->poff < 0 || (uint64_t)r->poff + r->size > ph->size)) { LOG("【红】 virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }
+     vpt_set(v, (uint64_t)r->voff, r->size, ph ? ph->mem + r->poff : NULL);
++    if (ph) phs_note(v, (uint64_t)r->voff, r->size, ph->mem + r->poff);
+     vm_address_t to = (vm_address_t)(v->base + r->voff);
+     // Not aliased (see above): kept in the page table; host pages of it already addressable become copies of the table (vsh_*), the others when a buffer first uses them
+     // 别名表（s2a_vp_alias_add / remove）依赖这里的对齐：只有 [voff, voff+size) 与源地址都按宿主页

@@ -1,0 +1,77 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 4ae0e09..a6bfadc 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4315,7 +4315,7 @@ static void mem_use_stamp(uint64_t ser) { uint64_t f = atomic_load(&g_cur_frame)
+ // S2Arm (fork): GPU memory of uploaded textures nobody has looked up for 1200 frames goes (every 600 frames, submit thread). Only textures uploaded from guest memory and never written by the GPU
+ //   (no pgpu), 8 MB and up: the next lookup uploads them again from the file-backed guest memory, as on first use. Mario Kart World kept 0.8 GB of sparse virtual-texture tiles and 0.5 GB of
+ //   packaged textures resident that way, and the iPad was killed for memory (11+ GB) when its big virtual texture was rebuilt. S2A_EVICT=0 turns it off
+-static void mem_evict_idle(void) {
++static void mem_evict_idle_ex(uint64_t idle_frames, uint64_t min_bytes) {
+     static int on = -1; if (on < 0) { const char *e = getenv("S2A_EVICT"); on = !(e && !strcmp(e, "0")); }
+     if (!on) return;
+     uint64_t fr = atomic_load(&g_cur_frame), ek[256]; int ne = 0; uint64_t eb = 0, es = 0;
+@@ -4325,15 +4325,15 @@ static void mem_evict_idle(void) {
+         id o = (__bridge id)v; if (![o isKindOfClass:[NvPkg class]]) continue;
+         NvPkg *pk = (NvPkg *)o; if (!pk->tex || pk->pgpu) continue;
+         uint64_t ser; memcpy(&ser, g_by_serial.keys + (size_t)i * g_by_serial.klen, 8);
+-        void *u = nvn_hm_get(&g_use_map, &ser); if (!u || fr - ((uint64_t)(uintptr_t)u - 1) <= 900) continue;
++        void *u = nvn_hm_get(&g_use_map, &ser); if (!u || fr - ((uint64_t)(uintptr_t)u - 1) <= idle_frames) continue;
+         SpInfo *s = pk->sparse ? sp_info(pk->tex) : nil; uint64_t b = s ? s->used * s->tileBytes : (uint64_t)pk->tex.allocatedSize;
+-        if (b < (1ull << 20)) continue;
++        if (b < min_bytes) continue;
+         ek[ne++] = ser; eb += b; if (s) es += b;
+     }
+     for (int k = 0; k < ne; k++) { id o = hm_get_id(&g_by_serial, &ek[k]); if (!o) continue; obj_drop(o); hm_del_id(&g_by_serial, &ek[k]); nvn_hm_del(&g_use_map, &ek[k]); }
+     if (ne) g_ser_gen++;
+     pthread_mutex_unlock(&g_smu);
+-    if (ne) { static uint64_t tot_n, tot_b; tot_n += (uint64_t)ne; tot_b += eb; MLOG("[mem] evicted %d textures unused for more than 1200 frames: %llu MB (%llu MB of it sparse tiles); %llu textures / %llu MB in all so far", ne, (unsigned long long)(eb >> 20), (unsigned long long)(es >> 20), (unsigned long long)tot_n, (unsigned long long)(tot_b >> 20)); }
++    if (ne) { static uint64_t tot_n, tot_b; tot_n += (uint64_t)ne; tot_b += eb; MLOG("[mem] evicted %d textures unused for more than %llu frames: %llu MB (%llu MB of it sparse tiles); %llu textures / %llu MB in all so far", ne, (unsigned long long)idle_frames, (unsigned long long)(eb >> 20), (unsigned long long)(es >> 20), (unsigned long long)tot_n, (unsigned long long)(tot_b >> 20)); }
+ }
+ static void mem_report(void) {
+     uint64_t fr = atomic_load(&g_cur_frame);
+@@ -4367,12 +4367,35 @@ static void mem_report(void) {
+     for (int k = 0; k < 6; k++) if (top[k].b >= (4ull << 20)) { char ib[32]; if (top[k].idle == ~0ull) snprintf(ib, sizeof ib, "never"); else snprintf(ib, sizeof ib, "%llu", (unsigned long long)top[k].idle);
+         MLOG("[mem]   idle: ser=%llu %s %ux%u pixel format %u %llu MB, last looked up %s frames ago", (unsigned long long)top[k].ser, cn[top[k].cls], top[k].w, top[k].h, top[k].fmt, (unsigned long long)(top[k].b >> 20), ib); }
+ }
++// S2Arm (fork): memory-budget guard. os_proc_available_memory() is how far the process is from the per-app limit (12.3 GB on the 12 GB iPad; the machine itself has 11.5 GB, and the system killed the game
++//   when a rebuild of a big sparse texture added its new copy to the old one at a footprint of 10.3 GB). A rebuild asks first: enough room for the new texture + staging + 512 MB margin? If not, idle
++//   textures go first, and if that is not enough the rebuild is postponed (the old texture keeps being sampled; retried every 30 frames) instead of the app being killed. S2A_MEM_GUARD=0 turns it off
++static uint64_t g_rb_skip_ser[8], g_rb_skip_fr[8];
++static int rb_guard_ok(NvPkg *pk, const tex_t *t) {
++    static int on = -1; if (on < 0) { const char *e_ = getenv("S2A_MEM_GUARD"); on = !(e_ && !strcmp(e_, "0")); }
++    if (!on) return 1;
++    uint64_t av = os_proc_available_memory(); if (!av) return 1;   // Mac: unknown
++    SpInfo *s = sp_info(pk->tex); uint64_t need = s ? s->used * s->tileBytes : (uint64_t)pk->tex.allocatedSize; need += need / 6 + (384ull << 20);
++    uint64_t fr = atomic_load(&g_cur_frame); int slot = -1;
++    for (int i = 0; i < 8; i++) if (g_rb_skip_ser[i] == t->serial) slot = i;
++    if (slot >= 0 && fr - g_rb_skip_fr[slot] < 30) return 0;   // asked a moment ago and there was not enough
++    if (av >= need + (512ull << 20)) return 1;
++    mem_evict_idle_ex(30, 64ull << 10);
++    uint64_t av2 = os_proc_available_memory();
++    if (av2 >= need + (512ull << 20)) return 1;
++    if (slot < 0) { for (int i = 0; i < 8; i++) if (!g_rb_skip_ser[i]) { slot = i; break; } if (slot < 0) slot = 0; }
++    g_rb_skip_ser[slot] = t->serial; g_rb_skip_fr[slot] = fr;
++    static int said; if (said++ < 60) MLOG("[mem] rebuild of sparse texture ser=%llu postponed: needs about %llu MB, %llu MB available (%llu MB after freeing idle textures)", (unsigned long long)t->serial, (unsigned long long)(need >> 20), (unsigned long long)(av >> 20), (unsigned long long)(av2 >> 20));
++    return 0;
++}
+ static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
+ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     tex_t *t = (tex_t *)ct;
+     if (!t || !t->serial) return nil;
+     mem_use_stamp(t->serial);
+-    { static uint64_t rep; uint64_t fr_ = atomic_load(&g_cur_frame); if (on_sub_thread() && fr_ / 600 != rep) { rep = fr_ / 600; if (fr_ >= 300) @autoreleasepool { mem_report(); mem_evict_idle(); } } }
++    { static uint64_t gov; uint64_t fr2 = atomic_load(&g_cur_frame); if (on_sub_thread() && fr2 / 120 != gov) { gov = fr2 / 120; uint64_t av = os_proc_available_memory(); static int goff = -1; if (goff < 0) { const char *e_ = getenv("S2A_MEM_GUARD"); goff = e_ && !strcmp(e_, "0"); }
++        if (!goff && av && av < (1536ull << 20)) @autoreleasepool { mem_evict_idle_ex(av < (768ull << 20) ? 30 : 120, 256ull << 10); } } }
++    { static uint64_t rep; uint64_t fr_ = atomic_load(&g_cur_frame); if (on_sub_thread() && fr_ / 600 != rep) { rep = fr_ / 600; if (fr_ >= 300) @autoreleasepool { mem_report(); mem_evict_idle_ex(900, 1ull << 20); } } }
+     if (on_sub_thread()) cpu_unc_drop();
+     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
+     // A sampled texture in a sparse virtual pool holds what the CPU wrote into the physical pages mapped there (Monster Hunter Rise: the hunter's innerwear, ASTC 6x6 with no packaged
+@@ -4456,6 +4479,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+             id<MTLTexture> reuse = nil;
+             if (pk->spare) { pthread_mutex_lock(&g_mu); uint64_t done = g_done; pthread_mutex_unlock(&g_mu); if (pk->spare_fence <= done && pk->spare.usage == pk->tex.usage) reuse = pk->spare; }
+             int incr = 0; if (pk->sparse && sparse_incr_ok(pk->tex, t)) { reuse = pk->tex; incr = 1; g_sp_incr = 1; g_sp_incr_vgen = pk->vgen; g_sp_incr_stamp = pk->stamp; }   // S2Arm (fork): re-upload in place
++            if (pk->sparse && !incr && !rb_guard_ok(pk, t)) return pk->view ? pk->view : pk->tex;   // S2Arm (fork): not enough room for the new copy yet
+             if (dirtycheck() && !pk->sparse) {   // DM_NVN_DIRTYCHECK diagnostic: a re-upload whose bytes equal the last upload's = dirty pages without a content change (S2Arm 10-25 Mario Kart 8: 72,234 re-uploads)
+                 static uint64_t n, same, same_b; static uint32_t big_w, big_h; static uint64_t big_b, big_ser; n++;
+                 if (full_hash(t->mem, t->L.size) == pk->hash) { same++; same_b += t->L.size; if (t->L.size > big_b) { big_b = t->L.size; big_ser = t->serial; big_w = t->d.width; big_h = t->d.height; } }

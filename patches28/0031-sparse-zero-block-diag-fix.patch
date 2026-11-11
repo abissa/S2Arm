@@ -1,0 +1,36 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index fa0cf29..fb2f331 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3436,7 +3436,9 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+         //   Whole-texture buffers (a copy and a staging area the size of the texture, 0.4 - 1.5 GB for Mario Kart World's virtual textures) took the process over iOS's 8 GB limit.
+         //   Unmapped pages read as zero: a level with no page behind it is simply left as created.
+         up_begin();
+-        uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0;
++        uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0; uint64_t zbz[16] = {0}, zbt[16] = {0}, zbfix = 0;   /* S2Arm (fork): all-zero 16-byte blocks per level of this upload */
++        static int zbfix_on = -1; if (zbfix_on < 0) { const char *e_ = getenv("S2A_ZB_FIX"); zbfix_on = e_ && *e_ && strcmp(e_, "0"); }
++        int astc_ = t->d.format >= 0x79 && t->d.format <= 0x94;
+         SpInfo *spi = sp_info(mt); NSIndexSet *oldm = g_sp_incr && spi ? [spi->mapped copy] : nil; if (spi) sparse_map_pending(spi, mt);
+         for (unsigned l = 0; sp_ok && l < d.mipmapLevelCount; l++) {
+             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
+@@ -3460,11 +3462,19 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+                     free(cb);
+                 } else {
+                     if (nvn_deswizzle(&t->d, l, y, tmp - lo, sg.contents, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); }
+-                    else { up_blit_add(sg, 0, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l); sp_bytes += sz; }
++                    else {
++                        if (bpb == 16 && !gdec) {   // S2Arm (fork): all-zero 16-byte blocks (ASTC decodes one as its error colour, magenta; BC6H / BC7 as black)
++                            uint64_t *q = (uint64_t *)sg.contents; size_t nb = pitch * rows * z / 16; uint64_t zc = 0;
++                            for (size_t i = 0; i < nb; i++) if (!(q[2 * i] | q[2 * i + 1])) { zc++; if (zbfix_on && astc_) { q[2 * i] = 0xFFFFFFFFFFFFFDFCull; q[2 * i + 1] = 0xFFFF000000000000ull; zbfix++; } }   // void-extent block: constant (0,0,0,1)
++                            zbz[l < 16 ? l : 15] += zc; zbt[l < 16 ? l : 15] += nb; }
++                        up_blit_add(sg, 0, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l); sp_bytes += sz; }
+                 }
+                 big_free(tmp, n);
+             }
+         }
++        { uint64_t ZZ = 0, TT = 0; for (int k = 0; k < 16; k++) { ZZ += zbz[k]; TT += zbt[k]; }
++          static int said_zb; if (TT && said_zb++ < 120) { char lb[200]; size_t o = 0; for (int k = 0; k < 16 && o < sizeof lb - 24; k++) if (zbz[k]) o += (size_t)snprintf(lb + o, sizeof lb - o, " L%d %llu/%llu", k, (unsigned long long)zbz[k], (unsigned long long)zbt[k]);
++              MLOG("[sparse-zb] ser=%llu format %#x: %llu of %llu 16-byte blocks are all zero (%llu %%)%s%s; %llu replaced by a void-extent block", (unsigned long long)t->serial, (unsigned)t->d.format, (unsigned long long)ZZ, (unsigned long long)TT, (unsigned long long)(ZZ * 100 / TT), ZZ ? ":" : "", lb, (unsigned long long)zbfix); } }
+         g_bp_up_bytes += sp_bytes;
+         if (t->L.size >= (256ull << 20)) { static int said_spd; if (said_spd++ < 40) MLOG("[sparse-up] ser=%llu %ux%u layers %u levels %u size %llu MB: %llu level-layers hold mapped pages = %llu MB (largest %llu MB), uploaded %llu MB",
+             (unsigned long long)t->serial, t->d.width, t->d.height, layers, nl, (unsigned long long)(t->L.size >> 20), (unsigned long long)sp_lvls, (unsigned long long)(sp_all >> 20), (unsigned long long)(sp_max >> 20), (unsigned long long)(sp_bytes >> 20)); }

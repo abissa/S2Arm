@@ -1,0 +1,108 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index b6cdc1f..38f2fe9 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3286,7 +3286,7 @@ static pthread_mutex_t g_vs_mu = PTHREAD_MUTEX_INITIALIZER;
+ static NSMutableArray *g_vs_heaps; static vs_tab_t *g_vs_tab; static vs_h_t *g_vs_h;
+ static uint32_t *g_vs_free; static size_t g_vs_nfree, g_vs_freecap;
+ static struct vs_late { uint32_t slot; uint64_t fence; } *g_vs_late; static size_t g_vs_nlate, g_vs_latecap;
+-static uint64_t g_vs_live, g_vs_peak, g_vs_shared, g_vs_maps, g_vs_unmaps, g_vs_reused;
++static uint64_t g_vs_live, g_vs_peak, g_vs_shared, g_vs_maps, g_vs_unmaps, g_vs_reused, g_vs_priv, g_vs_xfmt; static uint32_t g_vs_fmts[8]; static int g_vs_nfmts;
+ static int vs_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_SHARE_HEAP"); on = !(e && !strcmp(e, "0")); } return on && !g_m3 && g_q4 != nil; }
+ #define VST(...) do { static int n_; if (n_++ < 400) MLOG("[vt-trace] " __VA_ARGS__); } while (0)
+ static inline uint32_t vs_hash(uintptr_t k, uint32_t f) { return (uint32_t)((((uint64_t)k >> 12) * 0x9E3779B1u) ^ ((uint64_t)f * 0x85EBCA6Bu)) & (VS_HN - 1); }
+@@ -3380,7 +3380,8 @@ static void sparse_map_shared(SpInfo *s, id<MTLTexture> mt) {
+             if (!s->nkey[i] || !has) continue;
+             uintptr_t key = s->nkey[i] & ~(uintptr_t)1; int priv = (int)(s->nkey[i] & 1); uint32_t slot = priv ? ~0u : vs_find(key, s->td.format);
+             if (slot != ~0u) { g_vs_tab[slot].rc++; nsh++; g_vs_shared++; }
+-            else { if (!vs_alloc(&slot)) { nfail++; continue; } if (!priv) { g_vs_tab[slot].key = key; g_vs_tab[slot].fmt = s->td.format; vs_put(key, s->td.format, slot); } }
++            else { if (priv) g_vs_priv++; else { int seen = 0; for (int q_ = 0; q_ < g_vs_nfmts; q_++) { if (g_vs_fmts[q_] == s->td.format) seen = 1; else if (vs_find(key, g_vs_fmts[q_]) != ~0u) g_vs_xfmt++; } if (!seen && g_vs_nfmts < 8) g_vs_fmts[g_vs_nfmts++] = s->td.format; }
++                   if (!vs_alloc(&slot)) { nfail++; continue; } if (!priv) { g_vs_tab[slot].key = key; g_vs_tab[slot].fmt = s->td.format; vs_put(key, s->td.format, slot); } }
+             uint32_t hi = slot / VS_HEAP_TILES;
+             if (hi >= nh) { mp = realloc(mp, (size_t)(hi + 1) * sizeof *mp); if (!mp) MDIE("the shared mapping groups"); memset(mp + nh, 0, (size_t)(hi + 1 - nh) * sizeof *mp); nh = hi + 1; }
+             mp[hi].heap = g_vs_heaps[hi];
+@@ -3403,9 +3404,9 @@ static void sparse_map_shared(SpInfo *s, id<MTLTexture> mt) {
+ static void vs_report(uint64_t fr) {
+     if (!g_vs_heaps) return;
+     uint64_t chunks = 0, nt = 0; for (id<MTLTexture> mt in g_sp_all) { SpInfo *s = sp_info(mt); if (!s || !s->sh || !s->sslot) continue; nt++; for (uint64_t i = 0; i < s->nchunks; i++) chunks += s->sslot[i] != 0; }
+-    MLOG("[vt-heap-report] frame %llu: %llu shared tiles live (%llu MB) for %llu mapped chunks of %llu textures (%.2f places a tile); peak %llu; %llu onto an existing slot in all, %llu maps, %llu unmaps, %llu tiles reused; %lu heaps (%lu MB), device allocation %llu MB",
++    MLOG("[vt-heap-report] frame %llu: %llu shared tiles live (%llu MB) for %llu mapped chunks of %llu textures (%.2f places a tile); peak %llu; %llu onto an existing slot in all, %llu maps, %llu unmaps, %llu tiles reused; %lu heaps (%lu MB), device allocation %llu MB; chunks with a slot of their own (scattered pages) %llu, chunks whose memory another format already holds %llu",
+          (unsigned long long)fr, (unsigned long long)g_vs_live, (unsigned long long)(g_vs_live >> 4), (unsigned long long)chunks, (unsigned long long)nt, g_vs_live ? (double)chunks / (double)g_vs_live : 0.0, (unsigned long long)g_vs_peak,
+-         (unsigned long long)g_vs_shared, (unsigned long long)g_vs_maps, (unsigned long long)g_vs_unmaps, (unsigned long long)g_vs_reused, (unsigned long)g_vs_heaps.count, (unsigned long)(g_vs_heaps.count * 256), (unsigned long long)(g_dev.currentAllocatedSize >> 20));
++         (unsigned long long)g_vs_shared, (unsigned long long)g_vs_maps, (unsigned long long)g_vs_unmaps, (unsigned long long)g_vs_reused, (unsigned long)g_vs_heaps.count, (unsigned long)(g_vs_heaps.count * 256), (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)g_vs_priv, (unsigned long long)g_vs_xfmt);
+ }
+ // A GPU sparse texture of a terrain pool as a placement sparse texture of shared tiles; nil: not eligible (Metal's 64 KB tile must be the NVN tile, whole layers of 64 KB chunks, a mip tail of one tile): the old path
+ static id<MTLTexture> vs_create(const tex_t *t, MTLTextureDescriptor *d) {
+@@ -4768,8 +4769,9 @@ static void sp_tiles_report(uint64_t fr) {
+              (unsigned long long)fr, s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)s->used, (unsigned long long)s->cap, (unsigned long long)(s->hbytes >> 20), (unsigned long long)nm, (unsigned long long)s->nchunks,
+              (unsigned long long)s->c_map, (unsigned long long)s->c_un, (unsigned long long)s->c_full, (unsigned long long)dg); }
+ }
++static void sky_probe(uint64_t fr); static void cull_report(uint64_t fr);   // S2Arm (fork) render diagnostics (defined before dispatch)
+ static void mem_report(void) {
+-    uint64_t fr = atomic_load(&g_cur_frame); sp_tiles_report(fr); vs_report(fr);
++    uint64_t fr = atomic_load(&g_cur_frame); sp_tiles_report(fr); vs_report(fr); cull_report(fr); sky_probe(fr);
+     uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
+     uint64_t never_b = 0, never_n = 0;
+     struct { uint64_t b, ser, idle; unsigned w, h, fmt; int cls; } top[6]; memset(top, 0, sizeof top);
+@@ -14248,6 +14250,53 @@ static void img_wr_prescan(NvShader *sh, int nvn_stage) {
+     pthread_mutex_unlock(&g_rmu);
+ }
+ static void tensor_standin(NvShader *cs);   // nvn_tensor.inc
++// S2Arm (fork) render diagnostics. Two glitches of Mario Kart World that nxnative documents (upstream issue #1186 sky panels, and its vanishing scenery): tall streaked columns standing in the sky, and foliage that
++//   flickers in and out. Every 600 frames: how often the shaders involved ran (the culling pair, the foliage shader with the open first-invocation race, the displacement writer) and what they dispatched,
++//   and the 128x128x5 RGBA16F displacement array that moves the sky panels' vertices (large values there are what stretch them), read back and summarised
++static const char *const g_dg_key[] = {"e04783bda5a52269", "2ce9071c2f22d74f", "649e36162cad9e79", "8f3581eb40d8ce71", "90a9a728715fd08b"};
++static uint64_t g_dg_n[5], g_dg_first[5], g_dg_empty[5], g_dg_ind[5]; static uint32_t g_dg_x[5], g_dg_y[5], g_dg_z[5];
++static void cull_report(uint64_t fr) {
++    int any = 0; for (int k = 0; k < 5; k++) any |= g_dg_n[k] != 0; if (!any) return;
++    MLOG("[cull-diag] frame %llu, dispatches since the last report (indirect, empty, first-invocation stores a dispatch makes; last size): culling %s: %llu (%llu, %llu, %llu; %ux%ux%u) | list rebuild %s: %llu (%llu, %llu, %llu; %ux%ux%u) | foliage %s: %llu (%llu, %llu, %llu; %ux%ux%u) | displacement %s: %llu (%llu, %llu, %llu; %ux%ux%u)",
++         (unsigned long long)fr, g_dg_key[0], (unsigned long long)g_dg_n[0], (unsigned long long)g_dg_ind[0], (unsigned long long)g_dg_empty[0], (unsigned long long)g_dg_first[0], g_dg_x[0], g_dg_y[0], g_dg_z[0],
++         g_dg_key[1], (unsigned long long)g_dg_n[1], (unsigned long long)g_dg_ind[1], (unsigned long long)g_dg_empty[1], (unsigned long long)g_dg_first[1], g_dg_x[1], g_dg_y[1], g_dg_z[1],
++         g_dg_key[2], (unsigned long long)g_dg_n[2], (unsigned long long)g_dg_ind[2], (unsigned long long)g_dg_empty[2], (unsigned long long)g_dg_first[2], g_dg_x[2], g_dg_y[2], g_dg_z[2],
++         g_dg_key[3], (unsigned long long)g_dg_n[3], (unsigned long long)g_dg_ind[3], (unsigned long long)g_dg_empty[3], (unsigned long long)g_dg_first[3], g_dg_x[3], g_dg_y[3], g_dg_z[3]);
++    memset(g_dg_n, 0, sizeof g_dg_n); memset(g_dg_first, 0, sizeof g_dg_first); memset(g_dg_empty, 0, sizeof g_dg_empty); memset(g_dg_ind, 0, sizeof g_dg_ind);
++}
++static void sky_probe(uint64_t fr) {
++    static uint64_t last; if (fr < 600 || fr / 1200 == last) return; last = fr / 1200;
++    if (g_m3 || !g_q4 || !g_dev) return;
++    uint64_t sers[8]; int ns = 0, cands = 0;
++    pthread_mutex_lock(&g_rmu);
++    for (int tid = 1; tid < g_ntreg && ns < 8; tid++) { treg_t *r = &g_treg[tid]; if (!r->ok || r->gone || r->t.d.width != 128 || r->t.d.height != 128 || tex_layers(&r->t) != 5) continue;
++        cands++; int dup = 0; for (int i = 0; i < ns; i++) dup |= sers[i] == r->t.serial; if (!dup) sers[ns++] = r->t.serial; }
++    pthread_mutex_unlock(&g_rmu);
++    if (@available(macOS 26.0, iOS 26.0, *)) { @autoreleasepool {
++        int done = 0;
++        for (int i = 0; i < ns; i++) {
++            id h = tex_get(sers[i]); id<MTLTexture> mt = h && [h conformsToProtocol:@protocol(MTLTexture)] ? (id<MTLTexture>)h : nil;
++            if (!mt || mt.pixelFormat != MTLPixelFormatRGBA16Float || mt.width != 128 || mt.height != 128 || mt.arrayLength < 5) continue;
++            id<MTLBuffer> buf = [g_dev newBufferWithLength:5 * 128 * 128 * 8 options:MTLResourceStorageModeShared]; if (!buf) continue; res_add(buf); res_commit();
++            MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new]; NSError *ae = nil; id<MTL4CommandAllocator> al = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae];
++            id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer]; if (!al || !cb) continue;
++            [cb beginCommandBufferWithAllocator:al]; id e = enc_c_begin_on(cb, YES);
++            for (NSUInteger l = 0; l < 5; l++) [e copyFromTexture:mt sourceSlice:l sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(128, 128, 1) toBuffer:buf destinationOffset:l * 128 * 128 * 8 destinationBytesPerRow:128 * 8 destinationBytesPerImage:128 * 128 * 8];
++            enc_end_on(e, YES); [cb endCommandBuffer];
++            dispatch_semaphore_t sem = dispatch_semaphore_create(0); id o = fb_new(); fb_add(o, ^(id<MTL4CommitFeedback> f) { (void)f; dispatch_semaphore_signal(sem); });
++            id<MTL4CommandBuffer> bufs[] = {cb}; [g_q4 commit:bufs count:1 options:o];
++            if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC))) { MLOG("[sky-array] frame %llu ser=%llu: the read-back timed out", (unsigned long long)fr, (unsigned long long)sers[i]); continue; }
++            const __fp16 *px = (const __fp16 *)buf.contents; done++;
++            for (int l = 0; l < 5; l++) { float mx[4] = {0, 0, 0, 0}, ymin = 1e30f, ymax = -1e30f; int big = 0;
++                for (int k = 0; k < 128 * 128; k++) { const __fp16 *q = px + ((size_t)l * 128 * 128 + k) * 4; for (int c = 0; c < 4; c++) { float v = (float)q[c]; if (v != v) v = 1e9f; if (fabsf(v) > mx[c]) mx[c] = fabsf(v); }
++                    float y = (float)q[1]; if (y == y) { if (y < ymin) ymin = y; if (y > ymax) ymax = y; } if (fabsf((float)q[1]) > 50.0f) big++; }
++                MLOG("[sky-array] frame %llu ser=%llu layer %d: max |x| %.3f |y| %.3f |z| %.3f |w| %.3f, y from %.3f to %.3f, %d of 16384 texels with |y| > 50", (unsigned long long)fr, (unsigned long long)sers[i], l, mx[0], mx[1], mx[2], mx[3], ymin, ymax, big); }
++            res_remove(buf);
++            break;
++        }
++        if (!done) { static int said; if (said++ < 6) MLOG("[sky-array] frame %llu: no 128x128x5 RGBA16F array to read (%d registrations of that size, %d serials)", (unsigned long long)fr, cands, ns); }
++    } }
++}
+ static void dispatch(const p_dispatch *dp) {
+     geo_run_flush();
+     zskip_clear();
+@@ -14298,6 +14347,7 @@ static void dispatch(const p_dispatch *dp) {
+     // A store the shader makes on its very first invocation only, before the others run on the Switch: the build takes it out of the shader (S.Dsh first_store; upstream reference
+     //   implementation, MIT, c8521eeb / e07cba1c), as Apple's GPUs start workgroups in no order. The host makes it here, in order before this dispatch; an empty dispatch makes none.
+     //   A slot not bound, a word past the binding's size, or an address in no pool is skipped
++    for (int k_ = 0; k_ < 5; k_++) if (!strncmp(cs->key, g_dg_key[k_], 16)) { g_dg_n[k_]++; g_dg_first[k_] += (dp->ind || (dp->x && dp->y && dp->z)) ? (uint64_t)cs->rf.nfirst : 0; g_dg_empty[k_] += !(dp->ind || (dp->x && dp->y && dp->z)); g_dg_ind[k_] += dp->ind != 0; if (!dp->ind) { g_dg_x[k_] = dp->x; g_dg_y[k_] = dp->y; g_dg_z[k_] = dp->z; } }   // S2Arm (fork) diag
+     if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) {
+         const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg]; uint64_t at = 4ull * cs->rf.first[i].word; void *fb; uint64_t fo;
+         if (!u->addr || (u->size && at + 4 > u->size) || !nvn_be_addr(u->addr + at, 4, &fb, &fo)) { RED_ONCE(171, "first-invocation store of shader %s to storage slot %d word %u skipped: the slot is unbound, too small or in no pool", cs->key, cs->rf.first[i].reg, cs->rf.first[i].word); continue; }

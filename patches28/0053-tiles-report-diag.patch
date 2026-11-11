@@ -1,0 +1,43 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 08c0f49..c4ae6bb 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -303,7 +303,7 @@ static void big_tex_res(id<MTLResource> r, int line) {
+ static _Atomic uint64_t g_sp_live_n, g_sp_live_bytes, g_sp_created;
+ @interface SpInfo : NSObject { @public id<MTLHeap> heap; uint64_t hbytes, cap, used, tileBytes; NSUInteger tw, th, tailFirst, tailTiles; NSMutableIndexSet *tailDone, *mapped;
+     const void *pool; uint8_t *base; uint64_t size, gen, frame; nvn_texdesc td; uint64_t lsz; unsigned layers, nlev; int gpu;
+-    int tg; uint32_t ntw, nth; uint64_t nchunks, scan_gen; uint8_t *cbits; } @end   // S2Arm (fork) tg: mapped tile by tile (sparse_map_tiles): ntw x nth = the texels of one 64 KB chunk, cbits = the chunks that have tiles
++    int tg; uint32_t ntw, nth; uint64_t nchunks, scan_gen; uint8_t *cbits; uint64_t c_map, c_un, c_full, c_calls; } @end   // S2Arm (fork) tg: mapped tile by tile (sparse_map_tiles): ntw x nth = the texels of one 64 KB chunk, cbits = the chunks that have tiles
+ @implementation SpInfo
+ - (void)dealloc { free(cbits); if (hbytes) { atomic_fetch_sub(&g_sp_live_bytes, hbytes); atomic_fetch_sub(&g_sp_live_n, 1); } }
+ @end
+@@ -3382,6 +3382,8 @@ static void sparse_map_tiles(SpInfo *s, id<MTLTexture> mt) {
+                             s->used += tiles; tmap += tiles; nmap++; });
+                         if (ok) s->cbits[i] |= (uint8_t)(1u << q); else full++; } } }
+         if (en) { [en endEncoding]; [cb commit]; [cb waitUntilCompleted]; }
++        s->c_map += tmap; s->c_un += tun; s->c_full += full; s->c_calls++;   // S2Arm (fork) diag: totals per array for [tiles-report]
++        if (nun) { static int su; if (su++ < 400) MLOG("[tiles-gave-back] frame %llu: %ux%ux%u format %#x gave back %llu regions (%llu tiles, %llu MB); %llu of %llu tiles used now", (unsigned long long)atomic_load(&g_cur_frame), s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)nun, (unsigned long long)tun, (unsigned long long)((tun * s->tileBytes) >> 20), (unsigned long long)s->used, (unsigned long long)s->cap); }
+         static uint64_t said, said_full, tot_map, tot_un; tot_map += tmap; tot_un += tun;
+         if ((nmap || nun) && (said++ < 60 || said % 300 == 0)) MLOG("[sparse-tiles] %ux%ux%u format %#x: %llu regions mapped (%llu tiles, %llu MB), %llu given back (%llu tiles); %llu of %llu tiles used; device allocation %+lld MB, now %llu MB; %llu MB mapped and %llu MB given back in all",
+             s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)nmap, (unsigned long long)tmap, (unsigned long long)((tmap * s->tileBytes) >> 20), (unsigned long long)nun, (unsigned long long)tun, (unsigned long long)s->used, (unsigned long long)s->cap,
+@@ -4537,8 +4539,19 @@ static void mem_evict_idle_ex(uint64_t idle_frames, uint64_t min_bytes) {
+     pthread_mutex_unlock(&g_smu);
+     if (ne) { static uint64_t tot_n, tot_b; tot_n += (uint64_t)ne; tot_b += eb; MLOG("[mem] evicted %d textures unused for more than %llu frames: %llu MB (%llu MB of it sparse tiles); %llu textures / %llu MB in all so far", ne, (unsigned long long)idle_frames, (unsigned long long)(eb >> 20), (unsigned long long)(es >> 20), (unsigned long long)tot_n, (unsigned long long)(tot_b >> 20)); }
+ }
++// S2Arm (fork) diag: every 600 frames, for each terrain array mapped tile by tile: tiles used of its heap, chunks mapped, what happened since the last report, and how many mapping requests the game made
++//   (a course loading shows as a burst of them). Mario Kart World's Grand Prix loads several courses into the same arrays; the HDR one ran out of room (no room in its heap) on later courses
++static void sp_tiles_report(uint64_t fr) {
++    static uint64_t last_gen; uint64_t g = nvn_sparse_gen(); uint64_t dg = g - last_gen; last_gen = g;
++    for (id<MTLTexture> mt in g_sp_all) { SpInfo *s = sp_info(mt); if (!s || !s->tg || !s->cbits) continue;
++        uint64_t nm = 0; for (uint64_t i = 0; i < s->nchunks; i++) nm += s->cbits[i >> 3] >> (i & 7) & 1;
++        if (!s->c_calls && !nm) continue;
++        MLOG("[tiles-report] frame %llu: %ux%ux%u format %#x: %llu of %llu tiles used (%llu MB heap), %llu of %llu chunks mapped; in all mapped %llu tiles, gave back %llu tiles, %llu chunks refused for room; mapping requests by the game since the last report %llu",
++             (unsigned long long)fr, s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)s->used, (unsigned long long)s->cap, (unsigned long long)(s->hbytes >> 20), (unsigned long long)nm, (unsigned long long)s->nchunks,
++             (unsigned long long)s->c_map, (unsigned long long)s->c_un, (unsigned long long)s->c_full, (unsigned long long)dg); }
++}
+ static void mem_report(void) {
+-    uint64_t fr = atomic_load(&g_cur_frame);
++    uint64_t fr = atomic_load(&g_cur_frame); sp_tiles_report(fr);
+     uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
+     uint64_t never_b = 0, never_n = 0;
+     struct { uint64_t b, ser, idle; unsigned w, h, fmt; int cls; } top[6]; memset(top, 0, sizeof top);

@@ -1,0 +1,16 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index e33a6f8..84efc58 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3358,7 +3358,10 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+                     else {
+                         if (bpb == 16 && !gdec) {   // S2Arm (fork): all-zero 16-byte blocks (ASTC decodes one as its error colour, magenta; BC6H / BC7 as black)
+                             uint64_t *q = (uint64_t *)sg.contents; size_t nb = pitch * rows * z / 16; uint64_t zc = 0;
+-                            for (size_t i = 0; i < nb; i++) if (!(q[2 * i] | q[2 * i + 1])) { zc++; if (zbfix_on && astc_) { q[2 * i] = 0xFFFFFFFFFFFFFDFCull; q[2 * i + 1] = 0xFFFF000000000000ull; zbfix++; } }   // void-extent block: constant (0,0,0,1)
++                            for (size_t i = 0; i < nb; i++) if (!(q[2 * i] | q[2 * i + 1])) { zc++; if (zbfix_on && astc_) { static uint64_t c_ = 1; if (c_ == 1) { const char *e_ = getenv("S2A_ZB_ASTC"); unsigned long v_ = e_ && *e_ ? strtoul(e_, NULL, 16) : 0x000000FFul; uint64_t r_ = (v_ >> 24) & 255, g_ = (v_ >> 16) & 255, b_ = (v_ >> 8) & 255, a_ = v_ & 255; c_ = (r_ * 257) | (g_ * 257) << 16 | (b_ * 257) << 32 | (a_ * 257) << 48; }
++                                q[2 * i] = 0xFFFFFFFFFFFFFDFCull; q[2 * i + 1] = c_; zbfix++; }   /* S2Arm (fork): S2A_ZB_ASTC=RRGGBBAA is the constant colour of the void-extent block */
++                            else if (zbfix_on && (t->d.format == 0x50 || t->d.format == 0x4f)) { static long e6 = -1; if (e6 < 0) { const char *e_ = getenv("S2A_ZB_BC6"); e6 = e_ && *e_ ? atol(e_) & 1023 : 0; }
++                                if (e6) { uint64_t e_ = (uint64_t)e6; q[2 * i] = 3ull | e_ << 5 | e_ << 15 | e_ << 25 | e_ << 35 | e_ << 45 | e_ << 55; q[2 * i + 1] = e_ >> 9; zbfix++; } }   /* BC6H mode 11, both endpoints the same 10-bit grey: a constant block (S2A_ZB_BC6=1..1023; about 462 is 0.5, 495 is 1.0) */ }   // void-extent block: constant (0,0,0,1)
+                             zbz[l < 16 ? l : 15] += zc; zbt[l < 16 ? l : 15] += nb; }
+                         up_blit_add(sg, 0, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l); sp_bytes += sz; }
+                 }

@@ -1,0 +1,47 @@
+diff --git a/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs b/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs
+index 03b5193..7bf6fa8 100644
+--- a/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs
++++ b/compat/tree/src/Ryujinx.HLE/HOS/Services/Fs/IFileSystemProxy.cs
+@@ -358,6 +358,7 @@ namespace Ryujinx.HLE.HOS.Services.Fs
+         // OpenSaveDataFileSystem(u8 spaceId, nn::fs::SaveDataAttribute attribute) -> object<nn::fssrv::sf::IFileSystem> saveDataFs
+         public ResultCode OpenSaveDataFileSystem(ServiceCtx context)
+         {
++            long s2aP0 = context.RequestData.BaseStream.Position;
+             SaveDataSpaceId spaceId = (SaveDataSpaceId)context.RequestData.ReadInt64();
+             SaveDataAttribute attribute = context.RequestData.ReadStruct<SaveDataAttribute>();
+             using SharedRef<IFileSystem> fileSystem = new();
+@@ -367,6 +368,34 @@ namespace Ryujinx.HLE.HOS.Services.Fs
+ 
+             Result result = S2ASaveShare.OpenShared(key, ref fileSystem.Ref, (ref SharedRef<IFileSystem> fs) => _baseFileSystemProxy.Get.OpenSaveDataFileSystem(ref fs, spaceId, in attribute));
+             if (result.IsFailure())
++            {
++                // S2Arm (fork): Switch 2 games may open a save the NACP did not create. Log what was asked; if it does not exist, create it and retry once.
++                long s2aP1 = context.RequestData.BaseStream.Position;
++                context.RequestData.BaseStream.Position = s2aP0;
++                byte[] s2aRaw = context.RequestData.ReadBytes((int)(s2aP1 - s2aP0));
++                context.RequestData.BaseStream.Position = s2aP1;
++                Console.Error.WriteLine($"[fs-save] OpenSaveDataFileSystem failed {result.Value:X}: space={spaceId} type={attribute.Type} program={attribute.ProgramId.Value:X16} index={attribute.Index} rank={attribute.Rank} static={attribute.StaticSaveDataId:X16} raw={Convert.ToHexString(s2aRaw)} lastUser={context.Device.System.AccountManager.LastOpenedUser.UserId}");
++                if (ResultFs.TargetNotFound.Includes(result) && S2AHooks.ProgramId != 0)
++                {
++                    SaveDataAttribute s2aAttr = attribute;
++                    if (s2aAttr.ProgramId.Value == 0) s2aAttr.ProgramId = new ProgramId(S2AHooks.ProgramId & ~0xFul);
++                    SaveDataCreationInfo ci = default;
++                    ci.Size = 0x4000000;
++                    ci.JournalSize = 0x1000000;
++                    ci.BlockSize = 0x4000;
++                    ci.OwnerId = s2aAttr.ProgramId.Value;
++                    ci.SpaceId = spaceId;
++                    SaveDataMetaInfo mi = default;
++                    Result cr = _baseFileSystemProxy.Get.CreateSaveDataFileSystem(in s2aAttr, in ci, in mi);
++                    Console.Error.WriteLine($"[fs-save] created missing save (program {s2aAttr.ProgramId.Value:X16}): {cr.Value:X}");
++                    if (cr.IsSuccess())
++                    {
++                        result = S2ASaveShare.OpenShared(key, ref fileSystem.Ref, (ref SharedRef<IFileSystem> fs) => _baseFileSystemProxy.Get.OpenSaveDataFileSystem(ref fs, spaceId, in attribute));
++                        Console.Error.WriteLine($"[fs-save] reopen: {result.Value:X}");
++                    }
++                }
++            }
++            if (result.IsFailure())
+             {
+                 return (ResultCode)result.Value;
+             }

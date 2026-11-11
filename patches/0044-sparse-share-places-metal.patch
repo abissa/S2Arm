@@ -1,0 +1,85 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 84efc58..f1183db 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3128,6 +3128,7 @@ static void big_free(void *p, size_t n) {
+ static int vt_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_VT_GPU"); v = !(e && !strcmp(e, "0")); } return v; }   /* S2Arm (fork): on unless S2A_VT_GPU=0 */
+ static int vt_cna(const tex_t *t) { return vt_gpu_on() && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER; }
+ static int sparse_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_SPARSE_GPU"); v = e && *e && strcmp(e, "0"); } return v; }   // render-target textures of sparse pools as sparse textures too (S2A_SPARSE_GPU=1)
++static NSHashTable *g_sp_all;   // S2Arm (fork): the live sparse textures (weak), for sp_locate
+ static id<MTLHeap> sp_heap(NSUInteger bytes) {
+     MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked; hd.size = bytes;
+     return [g_dev newHeapWithDescriptor:hd];
+@@ -3183,6 +3184,8 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+     SpInfo *spi = [SpInfo new]; spi->hbytes = bytes; atomic_fetch_add(&g_sp_live_bytes, bytes); atomic_fetch_add(&g_sp_live_n, 1); atomic_fetch_add(&g_sp_created, 1); spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet]; spi->mapped = [NSMutableIndexSet indexSet];
+     spi->pool = t->pool; spi->base = (uint8_t *)t->mem; spi->size = t->L.size; spi->td = t->d; spi->lsz = ls; spi->layers = layers; spi->nlev = (unsigned)d.mipmapLevelCount; spi->gpu = gpu;
+     objc_setAssociatedObject(mt, &g_sp_key, spi, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++    if (!g_sp_all) g_sp_all = [NSHashTable weakObjectsHashTable];
++    [g_sp_all addObject:mt];
+     if (0) res_add_heap(hp);   // the heap is not put in the residency set: committing the set with sparse heaps in it crashed inside Metal (null object in res_commit)
+     { static int said_s; if (said_s++ < 60) MLOG("[sparse] %s texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB, %llu MB of it with mapped pages now) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed (%llu MB), heap %llu MB; device allocation +%lld MB after the heap, +%lld MB after the texture; %llu sparse textures alive (%llu MB of heaps), %llu created in all",
+         gpu ? "GPU" : "packaged", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long long)(mappedNow >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
+@@ -3239,6 +3242,55 @@ static int sparse_incr_ok(id<MTLTexture> mt, const tex_t *t) {
+     }
+     return spi->used + need <= spi->cap;
+ }
++// S2Arm (fork): the texels a 64 KB chunk of a sparse pool holds at one place are copied to another place that maps the same physical memory (hle_nvn.c phs_note). A chunk is one tile of a
++//   tiled level (64x64 blocks of 16 bytes, 128x64 of 8, 128x128 texels of 4, in rows across the level padded to whole tiles), or lies in the packed small levels: then those levels go whole
++typedef struct { const uint8_t *src, *dst; } sp_share_t;
++static sp_share_t *g_sps; static uint32_t g_sps_n, g_sps_cap; static os_unfair_lock g_sps_lk = OS_UNFAIR_LOCK_INIT; static _Atomic uint32_t g_sps_pending;
++void nvn_be_sparse_share(const uint8_t *src, const uint8_t *dst, uint64_t n) { (void)n;
++    os_unfair_lock_lock(&g_sps_lk);
++    if (g_sps_n == g_sps_cap) { uint32_t c = g_sps_cap ? g_sps_cap * 2 : 4096; sp_share_t *g = c <= (1u << 20) ? realloc(g_sps, c * sizeof *g) : NULL; if (!g) { os_unfair_lock_unlock(&g_sps_lk); return; } g_sps = g; g_sps_cap = c; }
++    g_sps[g_sps_n++] = (sp_share_t){src, dst}; atomic_store(&g_sps_pending, g_sps_n);
++    os_unfair_lock_unlock(&g_sps_lk);
++}
++typedef struct { __unsafe_unretained id<MTLTexture> tex; __unsafe_unretained SpInfo *spi; unsigned level, layer; uint32_t x, y, w, h; int tail; } sp_place;
++static int sp_locate(const uint8_t *va, sp_place *o) {
++    for (id<MTLTexture> mt in g_sp_all) { SpInfo *s = sp_info(mt); if (!s || va < s->base || va >= s->base + s->size || !s->lsz) continue;
++        uint64_t rel = (uint64_t)(va - s->base), layer = rel / s->lsz, in = rel % s->lsz; uint32_t nl = s->td.levels ? s->td.levels : 1; int bw, bh, bpb = nvn_fmt_bpb(s->td.format, &bw, &bh);
++        uint32_t tbw = bpb == 16 ? 64 : bpb == 8 || bpb == 4 ? 128 : 0, tbh = bpb == 16 || bpb == 8 ? 64 : bpb == 4 ? 128 : 0;
++        if (!tbw || layer >= s->layers) return 0;
++        for (unsigned l = 0; l < s->nlev && l < nl; l++) { uint64_t lo = nvn_tex_level_offset(&s->td, l), hi = l + 1 < nl ? nvn_tex_level_offset(&s->td, l + 1) : s->lsz;
++            if (in < lo || in >= hi) continue;
++            uint32_t w = MAX(s->td.width >> l, 1u), h = MAX(s->td.height >> l, 1u), wb = (w + (uint32_t)bw - 1) / (uint32_t)bw, hb = (h + (uint32_t)bh - 1) / (uint32_t)bh;
++            o->tex = mt; o->spi = s; o->level = l; o->layer = (unsigned)layer;
++            if (wb < tbw || hb < tbh) { o->tail = 1; o->x = o->y = 0; o->w = w; o->h = h; return 1; }
++            uint32_t nx = (wb + tbw - 1) / tbw; uint64_t k = (in - lo) / 0x10000; uint32_t tx = (uint32_t)(k % nx), ty = (uint32_t)(k / nx);
++            o->tail = 0; o->x = tx * tbw * (uint32_t)bw; o->y = ty * tbh * (uint32_t)bh; if (o->x >= w || o->y >= h) return 0;
++            o->w = MIN(tbw * (uint32_t)bw, w - o->x); o->h = MIN(tbh * (uint32_t)bh, h - o->y); return 1; }
++        return 0; }
++    return 0;
++}
++static void sp_share_run(void) {
++    sp_share_t *jobs; uint32_t n;
++    os_unfair_lock_lock(&g_sps_lk); jobs = g_sps; n = g_sps_n; g_sps = NULL; g_sps_n = g_sps_cap = 0; atomic_store(&g_sps_pending, 0); os_unfair_lock_unlock(&g_sps_lk);
++    if (!jobs) return;
++    static uint64_t done, miss, tails, same; int began = 0;
++    for (uint32_t i = 0; i < n && g_sp_all; i++) { sp_place s, d;
++        if (!sp_locate(jobs[i].src, &s) || !sp_locate(jobs[i].dst, &d)) { miss++; continue; }
++        if (s.tex == d.tex && s.level == d.level && s.layer == d.layer && s.x == d.x && s.y == d.y) { same++; continue; }
++        if (s.tex.pixelFormat != d.tex.pixelFormat || s.tail != d.tail || (!s.tail && (s.w != d.w || s.h != d.h)) || (s.tail && (s.level != d.level || s.tex.width != d.tex.width || s.tex.height != d.tex.height))) { miss++; continue; }
++        sparse_map_pending(d.spi, d.tex);
++        if (!began) { up_begin(); began = 1; }
++        if (!g_up_ce) { miss++; continue; }
++        if (!s.tail) { enc_b_copy_texture(g_up_ce, s.tex, s.layer, s.level, MTLOriginMake(s.x, s.y, 0), MTLSizeMake(s.w, s.h, 1), d.tex, d.layer, d.level, MTLOriginMake(d.x, d.y, 0)); done++; }
++        else { for (NSUInteger l = s.level; l < s.tex.mipmapLevelCount && l < d.tex.mipmapLevelCount; l++) { NSUInteger w = MAX(s.tex.width >> l, (NSUInteger)1), h = MAX(s.tex.height >> l, (NSUInteger)1);
++                   enc_b_copy_texture(g_up_ce, s.tex, s.layer, l, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), d.tex, d.layer, l, MTLOriginMake(0, 0, 0)); }
++               done++; tails++; }
++        [g_up_texs addObject:s.tex]; [g_up_texs addObject:d.tex];
++    }
++    free(jobs);
++    if (began) up_flush();
++    { static uint64_t said; if (said++ < 30 || said % 300 == 0) MLOG("[vt-share] %u requests: %llu copies in all (%llu of the small levels), %llu not placed, %llu already the same place", n, (unsigned long long)done, (unsigned long long)tails, (unsigned long long)miss, (unsigned long long)same); }
++}
+ // A GPU sparse texture follows the game's page mapping: when pages were mapped since the last look (and a few frames passed), the new ones get tiles
+ static void sparse_sync(SpInfo *spi, id<MTLTexture> mt) {
+     uint64_t g = nvn_sparse_gen(); if (g == spi->gen) return;
+@@ -4304,6 +4356,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     tex_t *t = (tex_t *)ct;
+     if (!t || !t->serial) return nil;
+     mem_use_stamp(t->serial);
++    if (on_sub_thread() && atomic_load_explicit(&g_sps_pending, memory_order_relaxed)) sp_share_run();   // S2Arm (fork): places that map the same physical pages
+     { static uint64_t gov; uint64_t fr2 = atomic_load(&g_cur_frame); if (on_sub_thread() && fr2 / 120 != gov) { gov = fr2 / 120; uint64_t av = os_proc_available_memory(); static int goff = -1; if (goff < 0) { const char *e_ = getenv("S2A_MEM_GUARD"); goff = e_ && !strcmp(e_, "0"); }
+         if (!goff && av && av < (1536ull << 20)) @autoreleasepool { mem_evict_idle_ex(av < (768ull << 20) ? 30 : 120, 256ull << 10); } } }
+     { static uint64_t rep; uint64_t fr_ = atomic_load(&g_cur_frame); if (on_sub_thread() && fr_ / 600 != rep) { rep = fr_ / 600; if (fr_ >= 300) @autoreleasepool { mem_report(); mem_evict_idle_ex(900, 1ull << 20); } } }

@@ -1,0 +1,26 @@
+diff --git a/ios/extdisplay.m b/ios/extdisplay.m
+index 2ccf06a..f1ff32a 100644
+--- a/ios/extdisplay.m
++++ b/ios/extdisplay.m
+@@ -7,6 +7,7 @@
+ //   窗口到直连出图层要挂时才建（s2a_ios_present_view，graphics/nvn/host_adapt.m 调）：加载页期间没有出图层，外接屏照旧镜像手机屏。
+ //   出图层在外接屏上时，手机屏留触屏手柄 / 提示页 / 开发浮层；屏幕比例改按外接屏算（ios/app.m screen_ratio），拔掉后出图层回手机屏。
+ //   开关：S2A_EXT_DISPLAY=0 = 不登记、不接管外接屏（照旧镜像）。
++#import <objc/message.h>
+ #import <UIKit/UIKit.h>
+ #include <stdatomic.h>
+ #include "native.h"
+@@ -78,8 +79,11 @@ id s2a_ios_ext_register(UIViewController *vc) {
+         // 委托类写在代码里、不取配置名：Info.plist 里不用声明外接屏场景
+         UISceneConfiguration *cfg = [[UISceneConfiguration alloc] initWithName:nil sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
+         cfg.delegateClass = S2AExternalSceneDelegate.class;
+-        UISceneAccessoryRegistration *reg = [vc registerSceneAccessory:[UISceneAccessory externalNonInteractiveSceneAccessoryWithConfiguration:cfg]];
+-        LOG("外接屏：场景配件已登记（启用 %d，显示器可用 %d）", (int)reg.enabled, (int)reg.available);
++        // S2Arm (fork): built with the iOS 26 SDK on a free GitHub runner, which does not declare the iOS 27 scene accessory API: the same calls through the runtime (iOS 27 devices have them)
++        Class acc = NSClassFromString(@"UISceneAccessory"); SEL mk = NSSelectorFromString(@"externalNonInteractiveSceneAccessoryWithConfiguration:"), rg = NSSelectorFromString(@"registerSceneAccessory:");
++        if (!acc || ![acc respondsToSelector:mk] || ![vc respondsToSelector:rg]) return nil;
++        id a_ = ((id (*)(id, SEL, id))objc_msgSend)(acc, mk, cfg); id reg = a_ ? ((id (*)(id, SEL, id))objc_msgSend)(vc, rg, a_) : nil;
++        LOG("外接屏：场景配件已登记（经运行时调用，iOS 26 SDK 构建）：%s", reg ? "ok" : "nil");
+         return reg;
+     }
+     return nil;

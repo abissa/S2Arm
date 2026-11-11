@@ -1,0 +1,17 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 2476a83..08c0f49 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3479,7 +3479,11 @@ static void sp_share_run(void) {
+                   if (!hit) MLOG("[vt-share] no place for the %s %p (other side %s): inside no sparse texture made so far (%lu of them)", !ls_ ? "source" : "destination", (const void *)bad, !ls_ ? (ld_ ? "placed" : "not placed") : "placed", (unsigned long)g_sp_all.count); }
+               continue; } }
+         if (s.tex == d.tex && s.level == d.level && s.layer == d.layer && s.x == d.x && s.y == d.y) { same++; continue; }
+-        if (s.tex.pixelFormat != d.tex.pixelFormat || s.tail != d.tail || (!s.tail && (s.w != d.w || s.h != d.h)) || (s.tail && (s.level != d.level || s.tex.width != d.tex.width || s.tex.height != d.tex.height))) { miss++; m_shape++; continue; }
++        if (s.tex.pixelFormat != d.tex.pixelFormat || s.tail != d.tail || (!s.tail && (s.w != d.w || s.h != d.h)) || (s.tail && (s.level != d.level || s.tex.width != d.tex.width || s.tex.height != d.tex.height))) { miss++; m_shape++;
++            static int said_s; if (said_s++ < 40 || said_s % 1000 == 0) MLOG("[vt-share] shapes differ #%d: source %p in %ux%ux%u format %#x (Metal %lu) level %u layer %u at %u,%u %ux%u small %d | destination %p in %ux%ux%u format %#x (Metal %lu) level %u layer %u at %u,%u %ux%u small %d", said_s,
++                (const void *)jobs[i].src, s.spi->td.width, s.spi->td.height, s.spi->layers, s.spi->td.format, (unsigned long)s.tex.pixelFormat, s.level, s.layer, s.x, s.y, s.w, s.h, s.tail,
++                (const void *)jobs[i].dst, d.spi->td.width, d.spi->td.height, d.spi->layers, d.spi->td.format, (unsigned long)d.tex.pixelFormat, d.level, d.layer, d.x, d.y, d.w, d.h, d.tail);
++            continue; }
+         sparse_map_pending(d.spi, d.tex);
+         if (!began) { up_begin(); began = 1; }
+         if (!g_up_ce) { miss++; m_enc++; continue; }

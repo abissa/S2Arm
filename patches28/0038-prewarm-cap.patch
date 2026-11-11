@@ -1,0 +1,15 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index afd7ff2..7d7c502 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -8684,6 +8684,10 @@ static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines)
+           MLOG("pipeline prewarm list %s: %lu lines", path.UTF8String, nl); }   // Diagnostics: how many lines each manifest gave (when a device warms up 0, shows which one was missing)
+         for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+             if (!line.length || [line hasPrefix:@"#"] || [seen containsObject:line]) continue;
++            // S2Arm (fork): at most S2A_WARM_MAX lines are prewarmed (3000 for a Switch 2 game, no limit otherwise). Mario Kart World's own list grew to 10,080 lines / 5,259 pipelines after a few sessions,
++            //   and every start with it died in the first seconds (Metal could not create a 16 MB buffer, then a fault in the residency set commit); with the archive moved away it started
++            { static long cap_ = -1; if (cap_ < 0) { const char *e_ = getenv("S2A_WARM_MAX"); cap_ = e_ && *e_ ? atol(e_) : (nvn2_on() ? 3000 : 0); }
++              if (cap_ > 0 && (long)seen.count >= cap_) { static int said_; if (!said_++) MLOG("pipeline prewarm: list cut at %ld lines (S2A_WARM_MAX)", cap_); continue; } }
+             [seen addObject:line];
+             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+             WarmTask *t = nil;

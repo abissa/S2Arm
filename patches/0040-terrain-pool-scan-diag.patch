@@ -1,0 +1,18 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 6d1bc8a..fedef63 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4006,6 +4006,13 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
+     if (ph && v->pool && (v->pool->flags & 0x1)) { int new_ = !tp_has(ph); tp_add(ph); static int n_; static uint64_t maps_, nzmaps_; maps_++;
+         uint64_t nz = 0, tot = 0; if (ph->mem && r->poff >= 0 && (uint64_t)r->poff + r->size <= ph->size) { const uint64_t *w = (const uint64_t *)(ph->mem + r->poff); tot = r->size / 8; for (uint64_t i = 0; i < tot; i += 8) nz += w[i] != 0; }
+         if (nz) nzmaps_++;
++        if (maps_ % 3000 == 0) {   // S2Arm (fork) diagnostic: does any of the terrain physical pools hold data anywhere (one word in 64 sampled)?
++            int with = 0, live = 0, shown = 0; uint64_t tw = 0, tnz = 0;
++            for (int i = 0; i < g_tpn; i++) { const pool_t *q = (const pool_t *)g_tp[i]; if (!q || q->magic != ph->magic || !q->mem || !q->size) continue; live++;
++                const uint64_t *w = (const uint64_t *)q->mem; uint64_t nw = q->size / 8, c = 0, first = ~0ull, last = 0;
++                for (uint64_t k = 0; k < nw; k += 64) if (w[k]) { c++; if (first == ~0ull) first = k * 8; last = k * 8; }
++                tw += nw / 64; tnz += c; if (c) { with++; if (shown++ < 6) LOG("[tp] scan: physical pool %p (%#llx bytes, flags %#x): %llu of %llu sampled words non-zero, between offsets %#llx and %#llx", (const void *)q, (unsigned long long)q->size, q->flags, (unsigned long long)c, (unsigned long long)(nw / 64), (unsigned long long)first, (unsigned long long)last); } }
++            LOG("[tp] scan after %llu maps: %d of %d live terrain physical pools hold data; %llu of %llu sampled words non-zero", (unsigned long long)maps_, with, live, (unsigned long long)tnz, (unsigned long long)tw); }
+         if (new_ ? n_++ < 60 : (nz && n_++ < 120) || maps_ % 2000 == 0) LOG("[tp] map into virtual pool %p (flags %#x) at %#llx+%#llx from physical pool %p (flags %#x, %#llx bytes, storage %p) offset %#llx%s: sampled words non-zero %llu of %llu; %llu maps so far, %llu with data, %d physical pools",
+             (const void *)v->pool, v->pool->flags, (unsigned long long)r->voff, (unsigned long long)r->size, (const void *)ph, ph->flags, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, new_ ? " (new pool)" : "", (unsigned long long)nz, (unsigned long long)(tot / 8), (unsigned long long)maps_, (unsigned long long)nzmaps_, g_tpn); }
+     if (ph && (!ph->mem || r->poff < 0 || (uint64_t)r->poff + r->size > ph->size)) { LOG("【红】 virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }

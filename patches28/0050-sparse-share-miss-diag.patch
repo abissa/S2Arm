@@ -1,0 +1,62 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 17c9691..2476a83 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3468,14 +3468,21 @@ static void sp_share_run(void) {
+     sp_share_t *jobs; uint32_t n;
+     os_unfair_lock_lock(&g_sps_lk); jobs = g_sps; n = g_sps_n; g_sps = NULL; g_sps_n = g_sps_cap = 0; atomic_store(&g_sps_pending, 0); os_unfair_lock_unlock(&g_sps_lk);
+     if (!jobs) return;
+-    static uint64_t done, miss, tails, same; int began = 0;
++    static uint64_t done, miss, tails, same; int began = 0; static uint64_t m_src, m_dst, m_shape, m_enc;
+     for (uint32_t i = 0; i < n && g_sp_all; i++) { sp_place s, d;
+-        if (!sp_locate(jobs[i].src, &s) || !sp_locate(jobs[i].dst, &d)) { miss++; continue; }
++        { int ls_ = sp_locate(jobs[i].src, &s), ld_ = sp_locate(jobs[i].dst, &d);   // S2Arm (fork) diag: which side has no place, and where it lies
++          if (!ls_ || !ld_) { miss++; if (!ls_) m_src++; if (!ld_) m_dst++;
++              static int said_l; if (said_l++ < 24) { const uint8_t *bad = !ls_ ? jobs[i].src : jobs[i].dst; int hit = 0;
++                  for (id<MTLTexture> mt_ in g_sp_all) { SpInfo *q = sp_info(mt_); if (!q || bad < q->base || bad >= q->base + q->size) continue; hit = 1;
++                      MLOG("[vt-share] no place for the %s %p (other side %s): inside %ux%ux%u format %#x levels %u at +%#llx (layer size %#llx, in the layer +%#llx)", !ls_ ? "source" : "destination", (const void *)bad, !ls_ ? (ld_ ? "placed" : "not placed") : "placed",
++                           q->td.width, q->td.height, q->layers, q->td.format, q->nlev, (unsigned long long)(bad - q->base), (unsigned long long)q->lsz, (unsigned long long)(q->lsz ? (uint64_t)(bad - q->base) % q->lsz : 0)); break; }
++                  if (!hit) MLOG("[vt-share] no place for the %s %p (other side %s): inside no sparse texture made so far (%lu of them)", !ls_ ? "source" : "destination", (const void *)bad, !ls_ ? (ld_ ? "placed" : "not placed") : "placed", (unsigned long)g_sp_all.count); }
++              continue; } }
+         if (s.tex == d.tex && s.level == d.level && s.layer == d.layer && s.x == d.x && s.y == d.y) { same++; continue; }
+-        if (s.tex.pixelFormat != d.tex.pixelFormat || s.tail != d.tail || (!s.tail && (s.w != d.w || s.h != d.h)) || (s.tail && (s.level != d.level || s.tex.width != d.tex.width || s.tex.height != d.tex.height))) { miss++; continue; }
++        if (s.tex.pixelFormat != d.tex.pixelFormat || s.tail != d.tail || (!s.tail && (s.w != d.w || s.h != d.h)) || (s.tail && (s.level != d.level || s.tex.width != d.tex.width || s.tex.height != d.tex.height))) { miss++; m_shape++; continue; }
+         sparse_map_pending(d.spi, d.tex);
+         if (!began) { up_begin(); began = 1; }
+-        if (!g_up_ce) { miss++; continue; }
++        if (!g_up_ce) { miss++; m_enc++; continue; }
+         if (!s.tail) { enc_b_copy_texture(g_up_ce, s.tex, s.layer, s.level, MTLOriginMake(s.x, s.y, 0), MTLSizeMake(s.w, s.h, 1), d.tex, d.layer, d.level, MTLOriginMake(d.x, d.y, 0)); done++; }
+         else { for (NSUInteger l = s.level; l < s.tex.mipmapLevelCount && l < d.tex.mipmapLevelCount; l++) { NSUInteger w = MAX(s.tex.width >> l, (NSUInteger)1), h = MAX(s.tex.height >> l, (NSUInteger)1);
+                    enc_b_copy_texture(g_up_ce, s.tex, s.layer, l, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), d.tex, d.layer, l, MTLOriginMake(0, 0, 0)); }
+@@ -3484,6 +3491,7 @@ static void sp_share_run(void) {
+     }
+     free(jobs);
+     if (began) up_flush();
++    { static uint64_t said_m; if (miss && (said_m++ < 30 || said_m % 300 == 0)) MLOG("[vt-share] not placed so far: source has no place %llu, destination has no place %llu, shapes differ %llu, no upload encoder %llu", (unsigned long long)m_src, (unsigned long long)m_dst, (unsigned long long)m_shape, (unsigned long long)m_enc); }
+     { static uint64_t said; if (said++ < 30 || said % 300 == 0) MLOG("[vt-share] %u requests: %llu copies in all (%llu of the small levels), %llu not placed, %llu already the same place", n, (unsigned long long)done, (unsigned long long)tails, (unsigned long long)miss, (unsigned long long)same); }
+ }
+ // S2Arm (fork): a GPU copy into a sparse texture is repeated at the other places that map the same physical memory, right behind it in the same encoder. Mario Kart World maps its terrain
+@@ -3503,18 +3511,19 @@ static void sp_propagate(const p_copy_t2t *c) {
+     uint32_t tw = tbw * (uint32_t)bw, th = tbh * (uint32_t)bh, nx = tail ? 1 : (wb + tbw - 1) / tbw;
+     uint32_t x0 = tail ? 0 : (uint32_t)MAX(c->dr.xoffset, 0) / tw, y0 = tail ? 0 : (uint32_t)MAX(c->dr.yoffset, 0) / th;
+     uint32_t x1 = tail ? 0 : ((uint32_t)MAX(c->dr.xoffset, 0) + (uint32_t)MAX(c->dr.width, 1) - 1) / tw, y1 = tail ? 0 : ((uint32_t)MAX(c->dr.yoffset, 0) + (uint32_t)MAX(c->dr.height, 1) - 1) / th;
+-    static uint64_t done, tails, asked; id<MTL4ComputeCommandEncoder> b = nil;
++    static uint64_t done, tails, asked; id<MTL4ComputeCommandEncoder> b = nil; static uint64_t p_np0, p_loc, p_fmt, p_size;
+     for (unsigned y = layer0; y < layer0 + nlay && y < s->layers; y++) for (uint32_t ty = y0; ty <= y1; ty++) for (uint32_t tx = x0; tx <= x1; tx++) {
+         const uint8_t *va = s->base + (uint64_t)y * s->lsz + lo + (tail ? 0 : (uint64_t)(ty * nx + tx) * 0x10000), *pl[4]; asked++;
+-        int np = nvn_sparse_places(s->pool, va, pl, 4);
+-        for (int i = 0; i < np; i++) { sp_place d; if (!sp_locate(pl[i], &d) || d.tex.pixelFormat != mt.pixelFormat || d.tail != tail) continue;
++        int np = nvn_sparse_places(s->pool, va, pl, 4); if (!np) p_np0++;
++        for (int i = 0; i < np; i++) { sp_place d; if (!sp_locate(pl[i], &d)) { p_loc++; continue; } if (d.tex.pixelFormat != mt.pixelFormat || d.tail != tail) { p_fmt++; continue; }
+             uint32_t sx = tx * tw, sy = ty * th; if (!tail && (sx >= w || sy >= h)) continue;
+             uint32_t cw = tail ? w : MIN(tw, w - sx), ch = tail ? h : MIN(th, h - sy);
+-            if (tail ? (d.level != level || d.tex.width != mt.width) : (d.w != cw || d.h != ch)) continue;
++            if (tail ? (d.level != level || d.tex.width != mt.width) : (d.w != cw || d.h != ch)) { p_size++; continue; }
+             sparse_map_pending(d.spi, d.tex);
+             if (!b) b = blit();
+             enc_b_copy_texture(b, mt, y, level, MTLOriginMake(tail ? 0 : sx, tail ? 0 : sy, 0), MTLSizeMake(cw, ch, 1), d.tex, d.layer, d.level, MTLOriginMake(d.x, d.y, 0)); done++; tails += tail; }
+     }
++    { static uint64_t said2; if (said2++ < 20 || said2 % 500 == 0) MLOG("[vt-share] copies into sparse so far: tiles with no other place %llu, other place not located %llu, other format or kind %llu, other size %llu", (unsigned long long)p_np0, (unsigned long long)p_loc, (unsigned long long)p_fmt, (unsigned long long)p_size); }
+     { static uint64_t said; if (said++ < 20 || said % 500 == 0) MLOG("[vt-share] copy into sparse ser=%llu level %u layer %u: %llu tiles asked so far, %llu copies to other places (%llu of small levels)", (unsigned long long)c->dst->serial, level, layer0, (unsigned long long)asked, (unsigned long long)done, (unsigned long long)tails); }
+ }
+ // A GPU sparse texture follows the game's page mapping: when pages were mapped since the last look (and a few frames passed), the new ones get tiles

@@ -1,0 +1,53 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 5436f22..f99c7e5 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4192,10 +4192,48 @@ static void sparse_view(NvPkg *pk, const tex_t *t) {
+     if (r != (unsigned)pk->vbase) { static int nl; if (nl++ < 6) MLOG("sparse texture ser=%llu %ux%u: sampled from level %u of %u (finer levels not mapped)", (unsigned long long)t->serial, t->d.width, t->d.height, r, n); }
+     pk->vbase = (int)r;
+ }
++// S2Arm (fork): memory breakdown every 600 frames ([mem] lines): what the game's textures and the residency set hold, and how much of it has not been looked up (tex_mtl_) for 300 / 1200 frames.
++//   Measurement only. The point is to see how much GPU memory an eviction of unused textures (re-uploaded from the file-backed guest memory when they come back) would free
++static nvn_hmap g_use_map = {.klen = 8};   // serial -> last frame tex_mtl_ looked it up + 1, under g_smu
++static void mem_use_stamp(uint64_t ser) { uint64_t f = atomic_load(&g_cur_frame) + 1; pthread_mutex_lock(&g_smu); nvn_hm_put(&g_use_map, &ser, (void *)(uintptr_t)f); pthread_mutex_unlock(&g_smu); }
++static void mem_report(void) {
++    uint64_t fr = atomic_load(&g_cur_frame);
++    uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
++    uint64_t never_b = 0, never_n = 0;
++    struct { uint64_t b, ser, idle; unsigned w, h, fmt; int cls; } top[6]; memset(top, 0, sizeof top);
++    pthread_mutex_lock(&g_smu);
++    for (uint32_t i = 0; i < g_by_serial.cap && g_by_serial.n; i++) {
++        void *v = g_by_serial.vals[i]; if (!v) continue;
++        uint64_t ser; memcpy(&ser, g_by_serial.keys + (size_t)i * g_by_serial.klen, 8);
++        id o = (__bridge id)v; id<MTLTexture> tx = nil; uint64_t b = 0; int cls;
++        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = (NvPkg *)o; tx = pk->tex; if (!tx) continue; SpInfo *s = pk->sparse ? sp_info(tx) : nil; if (s) { b = s->used * s->tileBytes; cls = 1; } else { b = tx.allocatedSize; cls = 0; } }
++        else if ([o conformsToProtocol:@protocol(MTLTexture)]) { tx = (id<MTLTexture>)o; b = tx.allocatedSize; cls = (tx.usage & MTLTextureUsageRenderTarget) ? 2 : 3; }
++        else continue;
++        void *u = nvn_hm_get(&g_use_map, &ser); uint64_t idle = u ? fr - ((uint64_t)(uintptr_t)u - 1) : ~0ull;
++        cnt[cls][0]++; byt[cls][0] += b;
++        if (idle > 300) { cnt[cls][1]++; byt[cls][1] += b; }
++        if (idle > 1200) { cnt[cls][2]++; byt[cls][2] += b; if (!u) { never_b += b; never_n++; } }
++        if (idle > 300 && cls != 1) { int m = 0; for (int k = 1; k < 6; k++) if (top[k].b < top[m].b) m = k; if (b > top[m].b) { top[m].b = b; top[m].ser = ser; top[m].idle = idle; top[m].w = (unsigned)tx.width; top[m].h = (unsigned)tx.height; top[m].fmt = (unsigned)tx.pixelFormat; top[m].cls = cls; } }
++    }
++    pthread_mutex_unlock(&g_smu);
++    uint64_t tb = 0, tn = 0, bb = 0, bn = 0, lb = 0, ln = 0;
++    pthread_mutex_lock(&g_res_mu); NSArray *all = g_res_objects.allObjects; pthread_mutex_unlock(&g_res_mu);
++    for (id<MTLResource> r in all) { uint64_t sz = r.allocatedSize; if ([r conformsToProtocol:@protocol(MTLBuffer)]) { bb += sz; bn++; if (sz >= (16ull << 20)) { lb += sz; ln++; } } else { tb += sz; tn++; } }
++    static const char *cn[4] = {"packaged", "sparse tiles", "render targets", "other GPU"};
++    MLOG("[mem] frame %llu: device allocation %llu MB; residency set: textures %llu MB (%llu), buffers %llu MB (%llu, of which >= 16 MB: %llu MB in %llu)", (unsigned long long)fr, (unsigned long long)(g_dev.currentAllocatedSize >> 20),
++         (unsigned long long)(tb >> 20), (unsigned long long)tn, (unsigned long long)(bb >> 20), (unsigned long long)bn, (unsigned long long)(lb >> 20), (unsigned long long)ln);
++    for (int c = 0; c < 4; c++) MLOG("[mem]   %-14s %6llu MB in %5llu | not looked up for > 300 frames: %6llu MB (%llu) | > 1200 or never: %6llu MB (%llu)", cn[c], (unsigned long long)(byt[c][0] >> 20), (unsigned long long)cnt[c][0],
++         (unsigned long long)(byt[c][1] >> 20), (unsigned long long)cnt[c][1], (unsigned long long)(byt[c][2] >> 20), (unsigned long long)cnt[c][2]);
++    MLOG("[mem]   never looked up since the host started: %llu MB in %llu textures", (unsigned long long)(never_b >> 20), (unsigned long long)never_n);
++    for (int k = 0; k < 6; k++) if (top[k].b >= (4ull << 20)) { char ib[32]; if (top[k].idle == ~0ull) snprintf(ib, sizeof ib, "never"); else snprintf(ib, sizeof ib, "%llu", (unsigned long long)top[k].idle);
++        MLOG("[mem]   idle: ser=%llu %s %ux%u pixel format %u %llu MB, last looked up %s frames ago", (unsigned long long)top[k].ser, cn[top[k].cls], top[k].w, top[k].h, top[k].fmt, (unsigned long long)(top[k].b >> 20), ib); }
++}
+ static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
+ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     tex_t *t = (tex_t *)ct;
+     if (!t || !t->serial) return nil;
++    mem_use_stamp(t->serial);
++    { static uint64_t rep; uint64_t fr_ = atomic_load(&g_cur_frame); if (on_sub_thread() && fr_ / 600 != rep) { rep = fr_ / 600; if (fr_ >= 300) @autoreleasepool { mem_report(); } } }
+     if (on_sub_thread()) cpu_unc_drop();
+     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
+     // A sampled texture in a sparse virtual pool holds what the CPU wrote into the physical pages mapped there (Monster Hunter Rise: the hunter's innerwear, ASTC 6x6 with no packaged

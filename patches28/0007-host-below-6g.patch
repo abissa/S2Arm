@@ -1,0 +1,80 @@
+diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
+index b45ec85..f8aac72 100644
+--- a/runtime/src/vawin.c
++++ b/runtime/src/vawin.c
+@@ -396,7 +396,38 @@ int s2a_process_prewarmed(void) {
+ #define TL_TAKE (2ull << 30)   // 窗口尾部统一分配接管这么多（见 s2a_window_trim）
+ #define TL_SMALL (256ull << 20)
+ #define MIN_WIN (2ull << 30)
+-#define HOST_BELOW (3ull << 30)   // 放不下标准布局时窗口下方留给宿主的地址（11-06：1 GB → 3 GB。iOS 上宿主可用地址 = 低区约 1.8 GB + 这一段；时之笛 Switch 2 版宿主峰值 1.7–2.1 GB，1 GB 时低区碰底在上屏路径崩。时之笛游戏最高只碰到窗口 +17.6 GB、异度3 碰到 +60.6 GB，3 GB 两者都装得下；≥3712 MB 会让 GC 上限改选分堆档吃掉收益）   // 窗口最少要这么多（模块 + 栈 + 堆前段放得下与否由布局判，layout.c）   // 窗口顶到空洞末尾时只接管这么多（九款尾部峰值 ≤ 202 MB，见 s2a_window_trim）
++#define HOST_BELOW (35ull << 30)   /* S2Arm (fork): was 3 GiB */
++
++// S2Arm (fork): virtual-pool arena. Mario Kart World makes many 1 GB sparse pools; each used to take whatever hole mmap(NULL) found (scattered through the 2 GB low region), so the big
++//   ones found no hole and the whole low region ran out (thread stacks, malloc, Metal failed). One contiguous PROT_NONE block is reserved below the window at start-up and pool
++//   addresses are cut from it (first fit, freed ranges merged back). The pool addresses are only numbers the game keeps; nothing but the page-table code dereferences them
++static uint64_t g_vpa_base, g_vpa_size;
++#define VPA_EXT 1024
++static struct { uint64_t lo, hi; } g_vpa_free[VPA_EXT]; static int g_vpa_nfree;
++static pthread_mutex_t g_vpa_mu = PTHREAD_MUTEX_INITIALIZER;
++static void *vpa_alloc(uint64_t len) {
++    uint64_t n = (len + 16383) & ~16383ull; void *r = NULL;
++    pthread_mutex_lock(&g_vpa_mu);
++    for (int i = 0; i < g_vpa_nfree; i++) if (g_vpa_free[i].hi - g_vpa_free[i].lo >= n) {
++        r = (void *)(uintptr_t)g_vpa_free[i].lo; g_vpa_free[i].lo += n;
++        if (g_vpa_free[i].lo == g_vpa_free[i].hi) { memmove(&g_vpa_free[i], &g_vpa_free[i + 1], (size_t)(g_vpa_nfree - i - 1) * sizeof g_vpa_free[0]); g_vpa_nfree--; }
++        break; }
++    pthread_mutex_unlock(&g_vpa_mu);
++    return r;
++}
++void s2a_vp_arena_free(const void *p, uint64_t len) {
++    uint64_t lo = (uint64_t)(uintptr_t)p, hi = lo + ((len + 16383) & ~16383ull);
++    if (!g_vpa_base || lo < g_vpa_base || hi > g_vpa_base + g_vpa_size) return;
++    pthread_mutex_lock(&g_vpa_mu);
++    int i = 0; while (i < g_vpa_nfree && g_vpa_free[i].lo < lo) i++;
++    int merged = 0;
++    if (i > 0 && g_vpa_free[i - 1].hi == lo) { g_vpa_free[i - 1].hi = hi; merged = 1; i--; }
++    else if (i < g_vpa_nfree && g_vpa_free[i].lo == hi) { g_vpa_free[i].lo = lo; merged = 1; }
++    else if (g_vpa_nfree < VPA_EXT) { memmove(&g_vpa_free[i + 1], &g_vpa_free[i], (size_t)(g_vpa_nfree - i) * sizeof g_vpa_free[0]); g_vpa_free[i].lo = lo; g_vpa_free[i].hi = hi; g_vpa_nfree++; }
++    if (merged && i + 1 < g_vpa_nfree && g_vpa_free[i].hi == g_vpa_free[i + 1].lo) { g_vpa_free[i].hi = g_vpa_free[i + 1].hi; memmove(&g_vpa_free[i + 1], &g_vpa_free[i + 2], (size_t)(g_vpa_nfree - i - 2) * sizeof g_vpa_free[0]); g_vpa_nfree--; }
++    pthread_mutex_unlock(&g_vpa_mu);
++}
++
+ static uint64_t g_need, g_fit;   // 本款要的跨度；2^39 以下最大能放的一块（1 GB 对齐后）——自检提示「本款需要 N GB，本机最多 M GB」用
+ void s2a_window_need(uint64_t *need, uint64_t *fit) { *need = g_need; *fit = g_fit; }
+ static char g_npdm[1100];   // 本款 main.npdm 路径（找不到可执行文件目录 / 模块目录时为空）：跨度算不出时按它说清原因
+@@ -568,6 +599,16 @@ static void vawin_reserve(void) {
+     if (p != (void *)at) { if (p != MAP_FAILED) munmap(p, want);
+         LOG("【红】地址窗口：空洞 %#llx +%llu MB 占不到（%s errno=%d）", (unsigned long long)at, (unsigned long long)(want >> 20), p == MAP_FAILED ? "失败" : "落在别处", er); s2a_window_probe("窗口没占到"); return; }
+     g_ok = 1; g_base = at; g_size = g_res = want;
++
++#if !TARGET_OS_OSX
++    if (g_keep_lo && HOST_BELOW > (5ull << 30)) {   // S2Arm (fork): contiguous virtual-pool arena right below the window
++        uint64_t vpa = HOST_BELOW - (4ull << 30);
++        void *vm = mmap((void *)(at - vpa), vpa, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        if (vm == (void *)(at - vpa)) { g_vpa_base = at - vpa; g_vpa_size = vpa; g_vpa_free[0].lo = g_vpa_base; g_vpa_free[0].hi = g_vpa_base + vpa; g_vpa_nfree = 1;
++            LOG("虚拟池区：%#llx +%llu MB（窗口下方一整块，虚拟池地址从这里切）", (unsigned long long)g_vpa_base, (unsigned long long)(vpa >> 20)); }
++        else { if (vm != MAP_FAILED) munmap(vm, vpa); LOG("【红】虚拟池区：%#llx +%llu MB 占不到，虚拟池照旧各自 mmap", (unsigned long long)(at - vpa), (unsigned long long)(vpa >> 20)); }
++    }
++#endif
+     guest_file_attach();
+     LOG("窗口已占 %#llx +%llu MB（本款要 %llu MB + 尾部统一分配 %llu MB；所在空洞 %llu MB、%s 以下最大一块 %llu MB、地址上限 %#llx）", (unsigned long long)at, (unsigned long long)(want >> 20),
+         (unsigned long long)(g_need >> 20), (unsigned long long)((want > g_need ? want - g_need : 0) >> 20), (unsigned long long)(sz >> 20), hb, (unsigned long long)(g_fit >> 20), (unsigned long long)top);
+@@ -636,7 +677,8 @@ void *s2a_cmd_arena_map(uint64_t len) {   // 录的进程：切一段可读写
+     pthread_mutex_unlock(&g_ca_mu);
+     return r;
+ }
+-void *s2a_vp_arena_map(uint64_t len) {   // 录的进程：给一段不可访问的地址（区里本来就是本进程的 PROT_NONE 保留）；没有区 / 放的进程 / 切满返回 NULL
++void *s2a_vp_arena_map(uint64_t len) {
++    if (g_vpa_base && len) return vpa_alloc(len);   // S2Arm (fork): contiguous arena below the window   // 录的进程：给一段不可访问的地址（区里本来就是本进程的 PROT_NONE 保留）；没有区 / 放的进程 / 切满返回 NULL
+     if (!g_ca_base || !g_ca_cut || !len) return NULL;
+     uint64_t n = (len + 16383) & ~16383ull; void *r = NULL;
+     pthread_mutex_lock(&g_ca_mu);
+@@ -645,7 +687,7 @@ void *s2a_vp_arena_map(uint64_t len) {   // 录的进程：给一段不可访问
+     pthread_mutex_unlock(&g_ca_mu);
+     return r;
+ }
+-int s2a_vp_arena_has(const void *p, uint64_t n) { uint64_t a = (uint64_t)(uintptr_t)p, b = g_ca_base + CMD_ARENA; return g_ca_base && a >= b && a + n <= b + g_va_cap; }
++int s2a_vp_arena_has(const void *p, uint64_t n) { uint64_t a = (uint64_t)(uintptr_t)p, b = g_ca_base + CMD_ARENA; return (g_ca_base && a >= b && a + n <= b + g_va_cap) || (g_vpa_base && a >= g_vpa_base && a + n <= g_vpa_base + g_vpa_size); }
+ int s2a_cmd_arena_has(const void *p, uint64_t n) { uint64_t a = (uint64_t)(uintptr_t)p; return g_ca_base && a >= g_ca_base && a + n <= g_ca_base + CMD_ARENA; }
+ // 区里的块还回：盖回不可访问（地址不再切，录局里会话重建才走到）
+ void s2a_cmd_arena_unmap(void *p, uint64_t len) { if (s2a_cmd_arena_has(p, len)) mmap(p, len, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0); else munmap(p, len); }

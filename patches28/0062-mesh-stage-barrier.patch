@@ -1,0 +1,14 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 1657b4d..a95080d 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -1457,7 +1457,8 @@ static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescri
+ static inline void enc_r_end_pass(id e) {
+     if (!barrier_game()) { m4_end(e); return; }
+     if (g_m3) { m4_end(e); g_last_end_relaxed = 1; return; }   // the fence is updated after the fragment stage either way; the next pass waits before its fragments only (enc_r_begin_pass)
+-    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
++    gp_end(e); { static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_MESH_BARRIER"); on_ = !(e_ && !strcmp(e_, "0")); }   // S2Arm (fork): the pass end waits for the mesh and object stages too (nxnative orders the mesh stage; task / mesh draws draw the vegetation, whose instance lists the next frame's culling pass rewrites). S2A_MESH_BARRIER=0 turns it off
++        [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | (on_ ? (MTLStageMesh | MTLStageObject) : 0) | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice]; }
+     [e endEncoding]; main_barrier_reset(); g_last_end_relaxed = 1;
+ }
+ static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) {

@@ -1,0 +1,36 @@
+diff --git a/compat/tree/src/Ryujinx.HLE/S2AHooks.cs b/compat/tree/src/Ryujinx.HLE/S2AHooks.cs
+index d58cac1..2799efc 100644
+--- a/compat/tree/src/Ryujinx.HLE/S2AHooks.cs
++++ b/compat/tree/src/Ryujinx.HLE/S2AHooks.cs
+@@ -14,6 +14,9 @@ namespace Ryujinx.HLE
+         // 游戏是 Switch 2 程序（NPDM 是 Switch 2 的 ACID 布局；services Application.Register 按 NpdmCompat 设）。只给语义随机型变的命令分派用
+         public static bool Switch2;
+ 
++        // S2Arm (fork): the running game's program id (set by services Application.Register); 0 = not registered yet
++        public static ulong ProgramId;
++
+         // GetDesiredLanguage when the game does not support the system language: try these in order before upstream's "first supported"
+         // (the host passes the system's preferred languages, then Simplified / Traditional Chinese, then English). Null = upstream.
+         public static Ryujinx.HLE.HOS.SystemState.TitleLanguage[] TitleLanguageFallback;
+diff --git a/services/S2A.Services/Application.cs b/services/S2A.Services/Application.cs
+index f7d6ebf..79f12e4 100644
+--- a/services/S2A.Services/Application.cs
++++ b/services/S2A.Services/Application.cs
+@@ -142,6 +142,17 @@ namespace S2A.Services
+             Aoc.Register(gameDir);   // DLC：aoc.tsv 里的全部登记为已拥有（有数据的挂 aoc/<idx>/，仅授权的挂载时报红）
+ 
+             Saves.SelectUser(device);
++            {
++                // S2Arm (fork): Switch 2 games may declare no user save size in the NACP but open an Account save anyway: make sure one is created
++                ref ApplicationControlProperty s2aCtl = ref nacp.Value;
++                Console.Error.WriteLine($"[nacp] user save {s2aCtl.UserAccountSaveDataSize:X}/{s2aCtl.UserAccountSaveDataJournalSize:X} device save {s2aCtl.DeviceSaveDataSize:X}/{s2aCtl.DeviceSaveDataJournalSize:X} owner {s2aCtl.SaveDataOwnerId:X16}");
++                if (s2aCtl.UserAccountSaveDataSize == 0)
++                {
++                    s2aCtl.UserAccountSaveDataSize = 0x4000000;
++                    s2aCtl.UserAccountSaveDataJournalSize = 0x1000000;
++                    Console.Error.WriteLine("[nacp] user save size was 0: set to 64 MB so an Account save is created");
++                }
++            }
+             Result saveResult = ProcessLoaderHelper.EnsureSaveData(device, new ApplicationId(applicationId), nacp);
+             if (requireSuccess) saveResult.ThrowIfFailure();
+             Saves.Seed(device, applicationId);

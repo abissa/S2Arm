@@ -1,0 +1,20 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 8036b00..8c2cffb 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -13932,6 +13932,15 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+       if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // In-process alternating measurement: this phase drops this class
+       if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return;
+       if (ms_draw(pr)) return; }
++    // S2Arm (fork) S2A_DRAWDUMP=<first frame>-<last frame>: one line per draw of those frames (shader pair, primitive, counts, indirect, depth state, target): with a still camera, what differs between frames is what flickers
++    { static long f0_ = -2, f1_; static long lastf_ = -1, dn_;
++      if (f0_ == -2) { const char *e_ = getenv("S2A_DRAWDUMP"); f0_ = e_ && *e_ ? atol(e_) : -1; f1_ = e_ && strchr(e_, '-') ? atol(strchr(e_, '-') + 1) : f0_; if (f0_ >= 0) MLOG("S2A_DRAWDUMP: logging every draw of frames %ld to %ld", f0_, f1_); }
++      if (f0_ >= 0 && !g_defer_replaying) { long fr_ = (long)atomic_load(&g_cur_frame);
++        if (fr_ >= f0_ && fr_ <= f1_) { if (fr_ != lastf_) { lastf_ = fr_; dn_ = 0; } dn_++;
++          const tex_t *c0_ = R.has_rt && R.rt.n > 0 ? R.rt.color[0] : NULL;
++          MLOG("[drawdump] F%ld #%ld vs %s fs %s prim %d count %d inst %d ind %d dt%d dw%d df%d wm%#x tgt %ux%u", fr_, dn_, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
++               dw ? (int)dw->prim : (int)di->prim, dw ? (int)dw->count : (int)di->count, dw ? (int)dw->instances : (int)di->instances, (dw ? dw->ind : di->ind) != 0 ? 1 : 0,
++               (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, S.chmask.mask, c0_ ? c0_->d.width : 0, c0_ ? c0_->d.height : 0); } } }
+     // Diagnostic DM_NVN_DRAW_MAX=<n> (frame replay, graphics/nvn/docs/frame_replay.md): draws past the n-th of a frame are dropped, and the n-th logs its program, blend state and targets
+     //   (DM_NVN_DRAWLOG=1: every draw up to the n-th logs it; DM_NVN_DRAW_SKIP=a-b drops the a-th to b-th draws of a frame) --
+     //   bisecting n on a replayed frame finds the draw that puts a wrong pixel on screen in seconds per step

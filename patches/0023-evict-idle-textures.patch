@@ -1,0 +1,43 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index f99c7e5..178dda1 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4196,6 +4196,29 @@ static void sparse_view(NvPkg *pk, const tex_t *t) {
+ //   Measurement only. The point is to see how much GPU memory an eviction of unused textures (re-uploaded from the file-backed guest memory when they come back) would free
+ static nvn_hmap g_use_map = {.klen = 8};   // serial -> last frame tex_mtl_ looked it up + 1, under g_smu
+ static void mem_use_stamp(uint64_t ser) { uint64_t f = atomic_load(&g_cur_frame) + 1; pthread_mutex_lock(&g_smu); nvn_hm_put(&g_use_map, &ser, (void *)(uintptr_t)f); pthread_mutex_unlock(&g_smu); }
++// S2Arm (fork): GPU memory of uploaded textures nobody has looked up for 1200 frames goes (every 600 frames, submit thread). Only textures uploaded from guest memory and never written by the GPU
++//   (no pgpu), 8 MB and up: the next lookup uploads them again from the file-backed guest memory, as on first use. Mario Kart World kept 0.8 GB of sparse virtual-texture tiles and 0.5 GB of
++//   packaged textures resident that way, and the iPad was killed for memory (11+ GB) when its big virtual texture was rebuilt. S2A_EVICT=0 turns it off
++static void mem_evict_idle(void) {
++    static int on = -1; if (on < 0) { const char *e = getenv("S2A_EVICT"); on = !(e && !strcmp(e, "0")); }
++    if (!on) return;
++    uint64_t fr = atomic_load(&g_cur_frame), ek[64]; int ne = 0; uint64_t eb = 0, es = 0;
++    pthread_mutex_lock(&g_smu);
++    for (uint32_t i = 0; i < g_by_serial.cap && g_by_serial.n && ne < 64; i++) {
++        void *v = g_by_serial.vals[i]; if (!v) continue;
++        id o = (__bridge id)v; if (![o isKindOfClass:[NvPkg class]]) continue;
++        NvPkg *pk = (NvPkg *)o; if (!pk->tex || pk->pgpu) continue;
++        uint64_t ser; memcpy(&ser, g_by_serial.keys + (size_t)i * g_by_serial.klen, 8);
++        void *u = nvn_hm_get(&g_use_map, &ser); if (!u || fr - ((uint64_t)(uintptr_t)u - 1) <= 1200) continue;
++        SpInfo *s = pk->sparse ? sp_info(pk->tex) : nil; uint64_t b = s ? s->used * s->tileBytes : (uint64_t)pk->tex.allocatedSize;
++        if (b < (8ull << 20)) continue;
++        ek[ne++] = ser; eb += b; if (s) es += b;
++    }
++    for (int k = 0; k < ne; k++) { id o = hm_get_id(&g_by_serial, &ek[k]); if (!o) continue; obj_drop(o); hm_del_id(&g_by_serial, &ek[k]); nvn_hm_del(&g_use_map, &ek[k]); }
++    if (ne) g_ser_gen++;
++    pthread_mutex_unlock(&g_smu);
++    if (ne) { static uint64_t tot_n, tot_b; tot_n += (uint64_t)ne; tot_b += eb; MLOG("[mem] evicted %d textures unused for more than 1200 frames: %llu MB (%llu MB of it sparse tiles); %llu textures / %llu MB in all so far", ne, (unsigned long long)(eb >> 20), (unsigned long long)(es >> 20), (unsigned long long)tot_n, (unsigned long long)(tot_b >> 20)); }
++}
+ static void mem_report(void) {
+     uint64_t fr = atomic_load(&g_cur_frame);
+     uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
+@@ -4233,7 +4256,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     tex_t *t = (tex_t *)ct;
+     if (!t || !t->serial) return nil;
+     mem_use_stamp(t->serial);
+-    { static uint64_t rep; uint64_t fr_ = atomic_load(&g_cur_frame); if (on_sub_thread() && fr_ / 600 != rep) { rep = fr_ / 600; if (fr_ >= 300) @autoreleasepool { mem_report(); } } }
++    { static uint64_t rep; uint64_t fr_ = atomic_load(&g_cur_frame); if (on_sub_thread() && fr_ / 600 != rep) { rep = fr_ / 600; if (fr_ >= 300) @autoreleasepool { mem_report(); mem_evict_idle(); } } }
+     if (on_sub_thread()) cpu_unc_drop();
+     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
+     // A sampled texture in a sparse virtual pool holds what the CPU wrote into the physical pages mapped there (Monster Hunter Rise: the hunter's innerwear, ASTC 6x6 with no packaged

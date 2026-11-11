@@ -1,0 +1,15 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 6f6c7c8..ad9c343 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -14351,8 +14351,8 @@ static void dispatch(const p_dispatch *dp) {
+     for (int k_ = 0; k_ < 5; k_++) if (!strncmp(cs->key, g_dg_key[k_], 16)) { g_dg_n[k_]++; g_dg_first[k_] += (dp->ind || (dp->x && dp->y && dp->z)) ? (uint64_t)cs->rf.nfirst : 0; g_dg_empty[k_] += !(dp->ind || (dp->x && dp->y && dp->z)); g_dg_ind[k_] += dp->ind != 0; if (!dp->ind) { g_dg_x[k_] = dp->x; g_dg_y[k_] = dp->y; g_dg_z[k_] = dp->z; } }   // S2Arm (fork) diag
+     // S2Arm (fork) experiment: S2A_FS_MODE=noind skips the host's first-invocation stores for indirect dispatches (whose GPU-side group count may be zero), =none for every dispatch. Default: as before
+     static int fs_mode = -1; if (fs_mode < 0) { const char *e_ = getenv("S2A_FS_MODE"); fs_mode = e_ && !strcmp(e_, "none") ? 2 : e_ && !strcmp(e_, "noind") ? 1 : 0; if (fs_mode) MLOG("first-invocation stores of compute dispatches: mode %s", fs_mode == 2 ? "none" : "noind"); }
+-    if (cs->rf.nfirst) { static int shown_[64]; static const void *seen_[64]; static int nseen_; int k_ = -1; for (int q_ = 0; q_ < nseen_; q_++) if (seen_[q_] == (const void *)cs) k_ = q_;
+-        if (k_ < 0 && nseen_ < 64) { k_ = nseen_; seen_[nseen_++] = cs; shown_[k_] = 0; }
++    if (cs->rf.nfirst) { static int shown_[64]; static const void *seen_[64]; static int nseen_; int k_ = -1; for (int q_ = 0; q_ < nseen_; q_++) if (seen_[q_] == (__bridge const void *)cs) k_ = q_;
++        if (k_ < 0 && nseen_ < 64) { k_ = nseen_; seen_[nseen_++] = (__bridge const void *)cs; shown_[k_] = 0; }
+         if (k_ >= 0 && !shown_[k_]++) for (int i = 0; i < cs->rf.nfirst; i++) { const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg];
+             MLOG("[first-store] shader %s store %d of %d: storage slot %d word %u value %#x (binding %s, address %#llx, size %u); dispatch %s %dx%dx%d", cs->key, i + 1, (int)cs->rf.nfirst, cs->rf.first[i].reg, cs->rf.first[i].word, (unsigned)cs->rf.first[i].value,
+                  u->addr ? "bound" : "unbound", (unsigned long long)u->addr, (unsigned)u->size, dp->ind ? "indirect" : "direct", dp->x, dp->y, dp->z); } }   // S2Arm (fork) diag: what each host-made first-invocation store writes, once per shader

@@ -1,0 +1,25 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 1013e6b..135e536 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -733,8 +733,10 @@ NVN(nvnTextureBuilderGetGLTextureName, uint32_t, const NVNtextureBuilder *b) { r
+ // ---- 稀疏贴图：本项目不支持 sparse tiling（Builder 的 sparse 布局一律按普通纹理建），查询时把输出结构清零并点名一次，
+ //      不返回「看起来像成功」的假布局 ----
+ NVN(nvnTextureGetSparseTileLayout, void, const NVNtexture *t, NVNtextureSparseTileLayout *layout) {
+-    (void)t; if (layout) memset(layout, 0, sizeof *layout);
+-    static int once; if (!once++) LOG("【红】 nvnTextureGetSparseTileLayout: sparse tiled textures are not supported, the layout is reported empty");
++    // 马里奥赛车 World：游戏按这个布局算要映射的字节数，回全零 → 0 字节映射请求 → MapVirtual 失败 → 游戏空指针崩。
++    //   贴图仍按普通纹理建（不做真稀疏），但回构建器同样算法的真实贴块尺寸
++    if (layout && t) { uint32_t tile[4]; nvn_tex_sparse_layout(&CTX(t)->d, tile); memcpy(layout, tile, sizeof tile); }
++    static int once; if (!once++) LOG("【红】 nvnTextureGetSparseTileLayout: sparse tiled textures are not supported (built as ordinary textures); the layout is computed like the builder's");
+ }
+ // ---- 调试 ID：NVN 没有 SetDebugID，驱动侧自行给。本层用对象的初始化序号（tex_t.serial，单调、每对象唯一、跨拷贝稳定）当调试 ID ----
+ NVN(nvnTextureGetDebugID, uint64_t, const NVNtexture *t) { return CTX(t)->serial; }
+@@ -4003,6 +4005,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
+     uint64_t pg = (uint64_t)getpagesize();
+     if (r->voff < 0 || (uint64_t)r->voff + r->size > v->size) { LOG("【红】 virtual pool %p: request at %#llx+%#llx is beyond the pool's %#llx", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)v->size); return 0; }
+     if (((uint64_t)r->voff | r->size | (uint64_t)r->poff) & 0xFFF) { LOG("【红】 virtual pool %p: request %#llx+%#llx (physical offset %#llx) is not 4 KB aligned", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)r->poff); return 0; }
++    if (r->size == 0) return 1;   // 0 字节请求无事可做（原先落到 vm_remap(0 字节) 回 KERN_INVALID_ARGUMENT → MapVirtual 失败）
+     const pool_t *ph = (const pool_t *)r->phys;
+     if (ph && (!ph->mem || r->poff < 0 || (uint64_t)r->poff + r->size > ph->size)) { LOG("【红】 virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }
+     vpt_set(v, (uint64_t)r->voff, r->size, ph ? ph->mem + r->poff : NULL);

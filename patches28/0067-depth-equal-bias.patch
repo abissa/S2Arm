@@ -1,0 +1,33 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 7d86ca0..4d20b43 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -9421,6 +9421,11 @@ int nvn_pso_harvest(const char *dir) {
+     MLOG("pipeline harvest into %s: depth mode %s, %llu written, %llu failed to write, %.1f s", dir, dm, (unsigned long long)atomic_load(&g_par_written), (unsigned long long)atomic_load(&g_par_write_failed), (bp_now() - t0) / 1e9);
+     return atomic_load(&g_par_written) ? 0 : 1;
+ }
++// S2Arm (fork): a depth pre-pass followed by a colour pass that tests depth for EQUAL (Mario Kart World's scenery: depth LESS with no colour, then EQUAL with no depth write; nxnative "Position invariance across shaders").
++//   Maxwell computes identical position math identically; the translated shaders do not always (the mesh stage's position is not [[invariant]]), so fragments that miss EQUAL by a hair drop out and flicker. EQUAL becomes
++//   LESS-EQUAL with a small bias toward the camera (S2A_EQ_BIAS depth steps, default 16, 0 = off): a surface that does not match the pre-pass by more than that still fails, as it did with EQUAL
++static float eq_bias(void) { static float v = -1; if (v < 0) { const char *e = getenv("S2A_EQ_BIAS"); v = e && *e ? (float)atof(e) : 16.0f; if (v > 0) MLOG("depth EQUAL passes: LESS-EQUAL with a bias of %.0f depth steps (S2A_EQ_BIAS)", v); } return v; }
++static int eq_draw(void) { return S.ds.dt && S.ds.df == 3 && eq_bias() > 0; }
+ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
+     struct { ds_st ds; uint32_t vm[2], wm[2]; int hd, hs; } k;
+     memset(&k, 0, sizeof k); k.ds = S.ds; memcpy(k.vm, S.st_vmask, 8); memcpy(k.wm, S.st_wmask, 8); k.hd = has_depth; k.hs = has_stencil;
+@@ -9428,7 +9433,7 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
+     id<MTLDepthStencilState> s = hm_get_id(&g_dss, &k);
+     if (s) return s;
+     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+-    if (has_depth && S.ds.dt) { d.depthCompareFunction = (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw; }
++    if (has_depth && S.ds.dt) { d.depthCompareFunction = eq_draw() ? MTLCompareFunctionLessEqual : (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw; }
+     if (has_stencil && S.ds.st) {
+         MTLStencilDescriptor *f = [MTLStencilDescriptor new], *b = [MTLStencilDescriptor new];
+         f.stencilCompareFunction = (MTLCompareFunction)(S.ds.sf_f - 1); f.stencilFailureOperation = (MTLStencilOperation)(S.ds.fail_f - 1);
+@@ -13510,6 +13515,7 @@ static int draw_pass_state(id en, NvShader *fs) {   // en: the render encoder (t
+       int wi = (S.poly.front == NVN_FRONT_FACE_CCW) != (s2a_nvn_rast_flip != 0) ? MTLWindingCounterClockwise : MTLWindingClockwise;
+       int fi = S.poly.mode == NVN_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill, cl = !S.depth_clamp;   // depth clip off = SetDepthClamp
+       float bi[3] = {0, 0, 0}; if (S.poly.offset_en & 4) { bi[0] = S.po.units; bi[1] = S.po.factor; bi[2] = S.po.clamp; }
++      if (eq_draw()) bi[0] -= eq_bias();   // S2Arm (fork): see eq_bias
+       if (!(g_ed.ok & ED_CULL) || g_ed.cull != cu) { enc_r_cull(en, (MTLCullMode)cu); g_ed.cull = cu; g_ed.ok |= ED_CULL; }
+       if (!(g_ed.ok & ED_WIND) || g_ed.wind != wi) { enc_r_winding(en, (MTLWinding)wi); g_ed.wind = wi; g_ed.ok |= ED_WIND; }
+       if (!(g_ed.ok & ED_FILL) || g_ed.fill != fi) { enc_r_fill(en, (MTLTriangleFillMode)fi); g_ed.fill = fi; g_ed.ok |= ED_FILL; }

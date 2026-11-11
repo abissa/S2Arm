@@ -1,0 +1,14 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_tex.c b/graphics/nvn/gfx/nvn/nvn_tex.c
+index 45db0af..d5eb013 100644
+--- a/graphics/nvn/gfx/nvn/nvn_tex.c
++++ b/graphics/nvn/gfx/nvn/nvn_tex.c
+@@ -5,6 +5,9 @@
+ // 4 of which differ from the automatic algorithm); when present it takes precedence.
+ #include "nvn_tex.h"
+ #include "nvn_fmt_info.h"
++#include <stdio.h>    // S2Arm (fork): getenv, strcmp, snprintf for the MINIMAL_LAYOUT note
++#include <stdlib.h>
++#include <string.h>
+ 
+ typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
+ 

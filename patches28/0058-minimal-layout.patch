@@ -1,0 +1,67 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 86d48ae..392781e 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4036,6 +4036,7 @@ static void phs_note(struct vpool *v, uint64_t voff, uint64_t size, const uint8_
+         if (!have) { int i = s->n < PHS_E ? s->n++ : s->next++ % PHS_E; s->e[i].pool = v->pool; s->e[i].va = va; }
+     }
+ }
++void s2a_gfx_log(const char *msg) { LOG("%s", msg); }   // S2Arm (fork): nvn_tex.c's [min-layout] notes
+ // S2Arm (fork): the shared-tile key of each 64 KB chunk of [a, a+n) (nvn_mtl.m vs_*): 0 when any of its 16 pages has no memory behind it, else the physical address of its first page, with bit 0 set when the 16 pages are
+ //   not consecutive physical memory (that chunk gets a slot of its own). prev holds the keys of the last look (a chunk whose first page still maps the same memory is not examined page by page); returns how many keys differ
+ uint64_t nvn_sparse_chunk_keys(const void *pool, uint64_t a, uint64_t n, const uintptr_t *prev, uintptr_t *out) {
+diff --git a/graphics/nvn/gfx/nvn/nvn_tex.c b/graphics/nvn/gfx/nvn/nvn_tex.c
+index e8d90d1..45db0af 100644
+--- a/graphics/nvn/gfx/nvn/nvn_tex.c
++++ b/graphics/nvn/gfx/nvn/nvn_tex.c
+@@ -106,6 +106,20 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
+     return level_walk(d, level, dpl, w, h, z, tileH, tileD, t, 0);
+ }
+ 
++// S2Arm (fork): bytes of one layer (all levels) for a block height / depth: a sparse texture's whole 64 KB tiles, a layered texture's layer aligned to its block
++static uint64_t layer_bytes_(const nvn_texdesc *d, unsigned levels, unsigned dpl, int layered, uint32_t w, uint32_t h, uint32_t z, unsigned tileH, unsigned tileD, fmt_t t) {
++    uint64_t ls = level_offset(d, levels, dpl, w, h, z, tileH, tileD, t);
++    if (sparse_of(d)) ls = (ls + SPARSE_TILE - 1) & ~(uint64_t)(SPARSE_TILE - 1);
++    if (layered) {                                                    // Layer size is aligned to the block
++        uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
++        while (th && hh <= (8u << (th - 1))) th--;
++        while (td && z <= (1u << (td - 1))) td--;
++        unsigned sh = th + td + 9; uint64_t g = ls >> sh;
++        if (ls != g << sh) ls = (g + 1) << sh;
++    }
++    return ls;
++}
++__attribute__((weak)) void s2a_gfx_log(const char *msg);   // hle_nvn.c writes it to the log (nvn_tex.c is also built without a log)
+ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
+     fmt_t t = fmt_of(d->format);
+     unsigned dpl; int layered; uint32_t w, h, z;
+@@ -128,17 +142,20 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
+     unsigned px, py, pz;
+     if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = (d->pkg_block_h & 0xff) ? (unsigned)(d->pkg_block_h & 0xff) - 1 : sparse_page(d, t, &px, &py, &pz) && sparse_levels(d) ? py : pick_tile(ah * 3 / 16); }
+     else if (dpl == 3) { if (sparse_page(d, t, &px, &py, &pz)) { tileH = py; tileD = pz; } else tileD = pick_tile(z + z / 2); }
+-    o->tileH = tileH; o->tileD = tileD;
+     unsigned levels = d->levels ? d->levels : 1;
+-    uint64_t ls = level_offset(d, levels, dpl, w, h, z, tileH, tileD, t);
+-    if (sparse_of(d)) ls = (ls + SPARSE_TILE - 1) & ~(uint64_t)(SPARSE_TILE - 1);
+-    if (layered) {                                                    // Layer size is aligned to the block
+-        uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
+-        while (th && hh <= (8u << (th - 1))) th--;
+-        while (td && z <= (1u << (td - 1))) td--;
+-        unsigned sh = th + td + 9; uint64_t g = ls >> sh;
+-        if (ls != g << sh) ls = (g + 1) << sh;
++    uint64_t ls = layer_bytes_(d, levels, dpl, layered, w, h, z, tileH, tileD, t);
++    // S2Arm (fork): MINIMAL_LAYOUT (0x200), as in nxnative (its PR #11, digitalhivehub's driver sweep): the driver keeps the automatic block height and depth only when the whole layer (every level, the layer
++    //   alignment) is no larger than with 1-GOB blocks, otherwise it takes 1-GOB blocks. A game that packs its resources by the driver's sizes gets textures larger than their slots from the automatic layout, and the
++    //   WriteTexels of one overwrote the mesh data stored right after it: terrain came out as huge stretched walls (Tears of the Kingdom, nxnative issue #183). A packaged layout and a sparse texture keep their own.
++    //   S2A_MIN_LAYOUT=0 turns it off
++    if ((d->flags & 0x200) && !(d->pkg_block_h & 0xff) && !sparse_of(d) && (tileH || tileD)) {
++        static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_MIN_LAYOUT"); on_ = !(e_ && !strcmp(e_, "0")); }
++        if (on_) { uint64_t one = layer_bytes_(d, levels, dpl, layered, w, h, z, 0, 0, t);
++            if (one != ls) { static int said_; if (said_++ < 24 && s2a_gfx_log) { char b_[320]; snprintf(b_, sizeof b_, "[min-layout] MINIMAL_LAYOUT texture %ux%ux%u format %#x target %d levels %u flags %#x: automatic block height %u / depth %u takes %llu bytes a layer, 1-GOB blocks %llu: using the 1-GOB layout",
++                    d->width, d->height, d->depth, d->format, (int)d->target, d->levels, d->flags, tileH, tileD, (unsigned long long)ls, (unsigned long long)one); s2a_gfx_log(b_); }
++                tileH = tileD = 0; ls = one; } }
+     }
++    o->tileH = tileH; o->tileD = tileD;
+     o->layer_size = ls;
+     o->size = layered ? ls * z : ls;
+     o->align = sparse_of(d) ? SPARSE_TILE : 512;

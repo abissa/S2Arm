@@ -1,0 +1,28 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 4ea85b0..86d48ae 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4036,6 +4036,23 @@ static void phs_note(struct vpool *v, uint64_t voff, uint64_t size, const uint8_
+         if (!have) { int i = s->n < PHS_E ? s->n++ : s->next++ % PHS_E; s->e[i].pool = v->pool; s->e[i].va = va; }
+     }
+ }
++// S2Arm (fork): the shared-tile key of each 64 KB chunk of [a, a+n) (nvn_mtl.m vs_*): 0 when any of its 16 pages has no memory behind it, else the physical address of its first page, with bit 0 set when the 16 pages are
++//   not consecutive physical memory (that chunk gets a slot of its own). prev holds the keys of the last look (a chunk whose first page still maps the same memory is not examined page by page); returns how many keys differ
++uint64_t nvn_sparse_chunk_keys(const void *pool, uint64_t a, uint64_t n, const uintptr_t *prev, uintptr_t *out) {
++    uint64_t nc = (n + 0xFFFF) >> 16, ch = 0; vp_lock(); struct vpool *v = vpool_at(pool, a);
++    uint64_t o0 = v ? a - (uint64_t)(uintptr_t)v->base : 0;
++    for (uint64_t i = 0; i < nc; i++) { uintptr_t key = 0;
++        if (v) { uint64_t o = (o0 + i * 0x10000) & ~0xFFFull;
++            if (o + 0x10000 <= v->size) { const vpte *e = vpt_get(v, o); const uint8_t *p0 = e ? e->phys : NULL;
++                if (p0) {
++                    if (prev && prev[i] && (prev[i] & ~(uintptr_t)1) == (uintptr_t)p0) key = prev[i];
++                    else { int full = 1, contig = 1;
++                        for (int k = 1; k < 16; k++) { const vpte *q = vpt_get(v, o + (uint64_t)k * 0x1000); if (!q || !q->phys) { full = 0; break; } if (q->phys != p0 + (uint64_t)k * 0x1000) contig = 0; }
++                        if (full) key = (uintptr_t)p0 | (contig ? 0 : 1); } } } }
++        if (!prev || prev[i] != key) ch++;
++        out[i] = key; }
++    vp_unlock(); return ch;
++}
+ // S2Arm (fork): which 64 KB chunks of [a, a+n) have memory behind them: bit i of bits is the chunk at a + i * 64 KB (its first page); returns how many
+ uint64_t nvn_sparse_chunks(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
+     uint64_t c = 0; vp_lock(); struct vpool *v = vpool_at(pool, a);

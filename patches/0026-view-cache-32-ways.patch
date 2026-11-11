@@ -1,0 +1,13 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 2774560..427044e 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -6320,7 +6320,7 @@ static void treg_drop_views(treg_t *r) {   // every view the ID caches (view, al
+ // registrations ended in a new Metal texture view, 45% of the replay's time. A hit is checked against the current base texture (re-uploads and format-view upgrades replace it).
+ // Only live textures are cached; entries go when the texture is finalized (nvn_be_tex_release) or its pool is (treg_drop_pool_views), and all of them past VC_MAX textures. Under g_rmu
+ typedef struct { uint32_t pf, l0, nl, s0, ns; uint8_t tt, sw[4], pad[3]; } vc_key;
+-enum { VC_WAYS = 4, VC_MAX = 16384 };
++enum { VC_WAYS = 32, VC_MAX = 16384 };   /* S2Arm (fork): 4 -> 32 views kept per texture (nxnative's phone runs use 64: no more 30-second stalls on Mario Kart World) */
+ typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS]; void *view[VC_WAYS];   // view: retained
+                  void *rows, *rows_of; uint64_t rows_rid, rows_n; int rows_exact; } vc_set;   // rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_of / rows_n: the buffer texture it was made from and its element count; rows_exact: the exact layout (f1d 2)
+ static nvn_hmap g_vc = {.klen = 8};   // texture serial → vc_set

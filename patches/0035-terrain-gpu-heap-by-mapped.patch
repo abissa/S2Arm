@@ -1,0 +1,22 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index c6d7554..7dcea02 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3161,7 +3161,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+             if (hi <= lo || hi > t->L.size) continue;
+             int any = nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo);
+             if (any) { mappedNow += hi - lo; pgb += nvn_sparse_count_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo); }
+-            if (!gpu && !any) continue;
++            if (!(gpu && !vt_cna(t)) && !any) continue;   /* S2Arm (fork): a GPU-owned terrain array (S2A_VT_GPU) gets tiles for the level-layers the game has mapped, as a packaged one does, not for the whole 5.8 GB */
+             if (l >= tailFirst) { if (![tl containsIndex:y]) { [tl addIndex:y]; need += tailTiles; } }
+             else need += (uint64_t)((w + ts.width - 1) / ts.width) * ((h + ts.height - 1) / ts.height);
+         }
+@@ -3169,7 +3169,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+     // S2Arm (fork): room to grow in place (0018): Mario Kart World's virtual texture arrays keep getting pages while the game runs (93 -> 681 MB in a minute); a full heap means a rebuild + full re-upload (0.2 - 0.9 s)
+     uint64_t slack_pct = 40; {   /* 20: a heap's size counts toward the ~18 GB device allocation Metal allows (Mario Kart World's buffers failed to create at 18.1 - 18.3 GB with 4.3 GB of heaps at 50 %) */ const char *e = getenv("S2A_SPARSE_SLACK"); if (e && *e) slack_pct = strtoull(e, NULL, 10); }
+     uint64_t bytes = (need + need * slack_pct / 100 + (gpu ? 64 : 2048)) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // slack, whole MB
+-    if (!gpu) { static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_MEM_GUARD"); on_ = !(e_ && !strcmp(e_, "0")); }
++    if (!gpu || vt_cna(t)) { static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_MEM_GUARD"); on_ = !(e_ && !strcmp(e_, "0")); }
+         uint64_t cur = g_dev.currentAllocatedSize, lim = 17600ull << 20;   // S2Arm (fork): the old heap is still counted in cur
+         if (on_ && cur + bytes > lim) { uint64_t minb = (need + need / 20 + 2048) * tileBytes; uint64_t room = lim > cur ? lim - cur : 0; uint64_t nb = room > minb ? room : minb; nb = (nb + 0xFFFFF) & ~0xFFFFFull;
+             static int said_t; if (said_t++ < 40) MLOG("[mem] sparse heap ser=%llu trimmed from %llu to %llu MB (device allocation %llu MB, ceiling %llu MB)", (unsigned long long)t->serial, (unsigned long long)(bytes >> 20), (unsigned long long)(nb >> 20), (unsigned long long)(cur >> 20), (unsigned long long)(lim >> 20));

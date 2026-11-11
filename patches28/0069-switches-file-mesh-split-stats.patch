@@ -48,10 +48,10 @@ index 2c74841..f769b87 100644
  
  
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 2d9f3f2..e68afc4 100644
+index 2d9f3f2..8036b00 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
-@@ -2086,6 +2086,28 @@ static uint64_t rep_ticks(const post_op *o, seg_clk *sc, uint32_t last, uint64_t
+@@ -2086,6 +2086,26 @@ static uint64_t rep_ticks(const post_op *o, seg_clk *sc, uint32_t last, uint64_t
  static uint64_t bp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
  static uint64_t g_bp_t0;   // Time of process start (when this module is loaded)
  __attribute__((constructor)) static void bp_t0(void) { g_bp_t0 = bp_now(); }
@@ -64,13 +64,11 @@ index 2d9f3f2..e68afc4 100644
 +    FILE *f = fopen(p, "r"); if (!f) return;
 +    char ln[300]; size_t o = 0;
 +    while (fgets(ln, sizeof ln, f)) {
-+        char *s = ln; while (*s == ' ' || *s == '	') s++;
-+        if (!*s || *s == '#' || *s == '
-+' || *s == '') continue;
++        char *s = ln; while (*s == ' ' || *s == 9) s++;
++        if (!*s || *s == '#' || *s == 10 || *s == 13) continue;
 +        char *eq = strchr(s, '='); if (!eq) continue;
-+        *eq = 0; char *v = eq + 1; v[strcspn(v, "
-+")] = 0;
-+        size_t kl = strlen(s); while (kl && (s[kl - 1] == ' ' || s[kl - 1] == '	')) s[--kl] = 0;
++        *eq = 0; char *v = eq + 1; v[strcspn(v, "\r\n")] = 0;
++        size_t kl = strlen(s); while (kl && (s[kl - 1] == ' ' || s[kl - 1] == 9)) s[--kl] = 0;
 +        if (!*s) continue;
 +        int had = getenv(s) != NULL; if (!had) setenv(s, v, 0);
 +        if (o < sizeof g_sw_note - 80) o += snprintf(g_sw_note + o, sizeof g_sw_note - o, " %s=%s%s", s, v, had ? "(launch env wins)" : "");
@@ -80,7 +78,7 @@ index 2d9f3f2..e68afc4 100644
  static int bootprof(void) { static int v = -1; if (v < 0) v = getenv("DM_BOOTPROF") != NULL; return v; }
  static uint64_t g_bp_lib_n, g_bp_lib_ns, g_bp_lib_wait_ns, g_bp_pso_n, g_bp_pso_ns, g_bp_up_bytes, g_bp_first_present;
  static uint64_t g_up_total_ns;   // Cumulative upload time (same source as the per-frame @upload_ms)
-@@ -4770,9 +4792,9 @@ static void sp_tiles_report(uint64_t fr) {
+@@ -4770,9 +4790,9 @@ static void sp_tiles_report(uint64_t fr) {
               (unsigned long long)fr, s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)s->used, (unsigned long long)s->cap, (unsigned long long)(s->hbytes >> 20), (unsigned long long)nm, (unsigned long long)s->nchunks,
               (unsigned long long)s->c_map, (unsigned long long)s->c_un, (unsigned long long)s->c_full, (unsigned long long)dg); }
  }

@@ -1,0 +1,24 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn2_codec.c b/graphics/nvn/gfx/nvn/nvn2_codec.c
+index ca80dd6..138b5f5 100644
+--- a/graphics/nvn/gfx/nvn/nvn2_codec.c
++++ b/graphics/nvn/gfx/nvn/nvn2_codec.c
+@@ -1280,8 +1280,19 @@ static const char *ns2_why(const char *n) {
+ // 装载器按名字问（runtime/src/gfxmode.c）：nn::codec 的视频部分、nn::syncpt、nn::gs、NVN2 原生图像（C 与 C++ 包装）；只在 Switch 2 进程上接。
+ //   规格源 = 4 款 sdk 的导出表（金刚 20.5 / raiders 21.4 / 火纹 22 / Pokopia）：这几族是句柄族（宿主发的解码器 / 图像 / 同步句柄，sdk 认不得）或依赖 gs / gsv 启动，
+ //   有实现的回实现；宿主做不到且有实证原路径必中止的回红桩（装载打红行，调用即中止点名）；其余回 NULL 照原路径
++// S2Arm (fork) experiment, S2A_NATIVE_MEM=1: nn::gs::sdk::CreateNativeMemory / DestroyNativeMemory answered by the host (success, a handle of its own) and logged, instead of the sdk's path
++//   into a graphics system that is not booted. Mario Kart World imports both; its terrain arrays' physical pools never receive data on this host
++static uint32_t nm_create(uint32_t *out, void *p, uint64_t size, int perm, int cache) {
++    static uint64_t k; k++; if (out) *out = (uint32_t)(0x4E4D0000u + (uint32_t)k);
++    if (k <= 60 || k % 500 == 0) LOG("[native-mem] CreateNativeMemory #%llu: memory %p size %#llx permission %d cacheability %d -> handle %#x", (unsigned long long)k, p, (unsigned long long)size, perm, cache, 0x4E4D0000u + (uint32_t)k);
++    return 0;
++}
++static uint32_t nm_destroy(uint32_t h) { static uint64_t k; k++; if (k <= 20) LOG("[native-mem] DestroyNativeMemory handle %#x", h); return 0; }
+ void *s2a_codec_entry(const char *name) {
+     if (!name || !nvn2_on()) return NULL;
++    { const char *e_ = getenv("S2A_NATIVE_MEM"); if (e_ && *e_ && strcmp(e_, "0")) {
++        if (!strcmp(name, "_ZN2nn2gs3sdk18CreateNativeMemoryEPNS0_18NativeMemoryHandleEPvmNS_2os16MemoryPermissionENS0_3cpu18MemoryCacheabilityE")) return (void *)nm_create;
++        if (!strcmp(name, "_ZN2nn2gs3sdk19DestroyNativeMemoryENS0_18NativeMemoryHandleE")) return (void *)nm_destroy; } }
+     for (unsigned i = 0; i < sizeof g_cv_names / sizeof *g_cv_names; i++)
+         if (!strcmp(name, g_cv_names[i].n)) return g_cv_names[i].f ? g_cv_names[i].f : (void *)cv_lib_ok;
+     for (unsigned i = 0; i < sizeof g_ni_names / sizeof *g_ni_names; i++) if (!strcmp(name, g_ni_names[i].n)) return g_ni_names[i].f;

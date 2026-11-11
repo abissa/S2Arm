@@ -1,0 +1,13 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 7dcea02..2ce5c38 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3125,7 +3125,7 @@ static void big_free(void *p, size_t n) {
+ // S2Arm (fork): sparse textures in a virtual pool the CPU cannot access (CPU_NO_ACCESS: Mario Kart World's 8192x8192x68 terrain arrays, pool flags 0x2a1) hold nothing the CPU wrote: every
+ //   guest word behind them was zero (0 of 17 - 67 million non-zero), so uploading them from guest memory gave all-zero blocks (ASTC decodes one as magenta) and every re-upload wiped what the GPU had
+ //   written. With S2A_VT_GPU=1 they are GPU textures instead: sparse, tiles mapped as the game maps pages (every frame), filled only by the GPU's own copies and draws
+-static int vt_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_VT_GPU"); v = e && *e && strcmp(e, "0"); } return v; }
++static int vt_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_VT_GPU"); v = !(e && !strcmp(e, "0")); } return v; }   /* S2Arm (fork): on unless S2A_VT_GPU=0 */
+ static int vt_cna(const tex_t *t) { return vt_gpu_on() && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER; }
+ static int sparse_gpu_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_SPARSE_GPU"); v = e && *e && strcmp(e, "0"); } return v; }   // render-target textures of sparse pools as sparse textures too (S2A_SPARSE_GPU=1)
+ static id<MTLHeap> sp_heap(NSUInteger bytes) {

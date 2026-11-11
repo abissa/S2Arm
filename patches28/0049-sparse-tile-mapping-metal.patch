@@ -1,0 +1,131 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 734355e..17c9691 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -302,9 +302,10 @@ static void big_tex_res(id<MTLResource> r, int line) {
+ //   memory limit. A sparse texture is created from a sparse heap and only the tiles that hold mapped pages get memory: SpInfo keeps the heap, the tile accounting and what is needed to map more later
+ static _Atomic uint64_t g_sp_live_n, g_sp_live_bytes, g_sp_created;
+ @interface SpInfo : NSObject { @public id<MTLHeap> heap; uint64_t hbytes, cap, used, tileBytes; NSUInteger tw, th, tailFirst, tailTiles; NSMutableIndexSet *tailDone, *mapped;
+-    const void *pool; uint8_t *base; uint64_t size, gen, frame; nvn_texdesc td; uint64_t lsz; unsigned layers, nlev; int gpu; } @end
++    const void *pool; uint8_t *base; uint64_t size, gen, frame; nvn_texdesc td; uint64_t lsz; unsigned layers, nlev; int gpu;
++    int tg; uint32_t ntw, nth; uint64_t nchunks, scan_gen; uint8_t *cbits; } @end   // S2Arm (fork) tg: mapped tile by tile (sparse_map_tiles): ntw x nth = the texels of one 64 KB chunk, cbits = the chunks that have tiles
+ @implementation SpInfo
+-- (void)dealloc { if (hbytes) { atomic_fetch_sub(&g_sp_live_bytes, hbytes); atomic_fetch_sub(&g_sp_live_n, 1); } }
++- (void)dealloc { free(cbits); if (hbytes) { atomic_fetch_sub(&g_sp_live_bytes, hbytes); atomic_fetch_sub(&g_sp_live_n, 1); } }
+ @end
+ static const char g_sp_key = 0;
+ static SpInfo *sp_info(id r) { return r ? objc_getAssociatedObject(r, &g_sp_key) : nil; }
+@@ -3245,6 +3246,30 @@ static id<MTLHeap> sp_heap(NSUInteger bytes) {
+     MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypeSparse; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked; hd.size = bytes;
+     return [g_dev newHeapWithDescriptor:hd];
+ }
++// S2Arm (fork): GPU sparse textures of the terrain pools get their tiles chunk by chunk, as the game maps its 64 KB chunks, and give them back when it unmaps them (S2A_VT_TILES=0: by whole
++//   level and layer as before, never given back; S2A_VT_UNMAP=0 keeps the tiles of unmapped chunks). By level and layer a heap sized for what was mapped when the texture was made had
++//   no room for the next 8192x8192 layer (4096 tiles), so Mario Kart World's sampled terrain arrays stayed without their detailed levels ("no room left in its heap", seconds after they
++//   were made) and read zero there, and its single-layer 8192 / 16384 textures took 170 - 341 MB of tiles for 2 - 6 MB of mapped chunks
++uint64_t nvn_sparse_chunks(const void *pool, uint64_t a, uint64_t n, uint8_t *bits);   // hle_nvn.c
++static int sp_tg_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_TILES"); on = !(e && !strcmp(e, "0")); } return on; }
++typedef void (^sp_rg_blk)(unsigned l, unsigned y, MTLRegion rg, uint64_t tiles, int kind);   // kind 0: the tiles of one chunk of a tiled level, 1: a whole small level, 2: the Metal mip tail of the layer
++static void sp_chunk_regions(SpInfo *s, uint64_t idx, sp_rg_blk blk) {
++    uint64_t o = idx * 0x10000ull; unsigned y = (unsigned)(o / s->lsz); if (y >= s->layers) return;
++    uint64_t in = o - (uint64_t)y * s->lsz, end = in + 0x10000; uint32_t nl = s->td.levels ? s->td.levels : 1;
++    for (unsigned l = 0; l < s->nlev && l < nl; l++) {
++        uint64_t lo = nvn_tex_level_offset(&s->td, l), hi = l + 1 < nl ? nvn_tex_level_offset(&s->td, l + 1) : s->lsz;
++        if (hi <= in) continue;
++        if (lo >= end) break;
++        if (l >= s->tailFirst) { blk((unsigned)s->tailFirst, y, MTLRegionMake3D(0, 0, 0, s->tailTiles, 1, 1), s->tailTiles, 2); break; }
++        uint32_t w = MAX(s->td.width >> l, 1u), h = MAX(s->td.height >> l, 1u);
++        NSUInteger nx = (w + s->tw - 1) / s->tw, ny = (h + s->th - 1) / s->th;
++        if (w < s->ntw || h < s->nth) { blk(l, y, MTLRegionMake3D(0, 0, 0, nx, ny, 1), (uint64_t)nx * ny, 1); continue; }
++        uint64_t k = ((in > lo ? in : lo) - lo) / 0x10000; uint32_t cnx = (w + s->ntw - 1) / s->ntw, tx = (uint32_t)(k % cnx), ty = (uint32_t)(k / cnx);
++        NSUInteger x0 = (NSUInteger)tx * s->ntw / s->tw, y0 = (NSUInteger)ty * s->nth / s->th; if (x0 >= nx || y0 >= ny) continue;
++        NSUInteger rw = MIN((NSUInteger)(s->ntw / s->tw), nx - x0), rh = MIN((NSUInteger)(s->nth / s->th), ny - y0);
++        blk(l, y, MTLRegionMake3D(x0, y0, 0, rw, rh, 1), (uint64_t)rw * rh, 0);
++    }
++}
+ static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt);
+ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int gpu) {   // nil = not a texture for this (create it whole, as before)
+     if (!g_q4 || !g_dev || !t->pool || !nvn_sparse_pool(t->pool)) return nil;
+@@ -3280,8 +3305,25 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+         }
+     }
+     // S2Arm (fork): room to grow in place (0018): Mario Kart World's virtual texture arrays keep getting pages while the game runs (93 -> 681 MB in a minute); a full heap means a rebuild + full re-upload (0.2 - 0.9 s)
++    SpInfo *pre = nil; uint64_t room_tiles = 0;   // S2Arm (fork): tile by tile (sparse_map_tiles): the tiles the mapped chunks need now, and room for what the game maps later
++    if (gpu && vt_cna(t) && sp_tg_on()) { int bw_, bh_, bpb_ = nvn_fmt_bpb(t->d.format, &bw_, &bh_); uint32_t tbw_ = bpb_ == 16 ? 64 : bpb_ == 8 || bpb_ == 4 ? 128 : 0, tbh_ = bpb_ == 16 || bpb_ == 8 ? 64 : bpb_ == 4 ? 128 : 0;
++        uint32_t ntw_ = tbw_ * (uint32_t)bw_, nth_ = tbh_ * (uint32_t)bh_;
++        if (tbw_ && ls && !(ls & 0xFFFF) && !(ntw_ % ts.width) && !(nth_ % ts.height)) {
++            pre = [SpInfo new]; pre->tw = ts.width; pre->th = ts.height; pre->tailFirst = tailFirst; pre->tailTiles = tailTiles; pre->tailDone = [NSMutableIndexSet indexSet]; pre->mapped = [NSMutableIndexSet indexSet];
++            pre->pool = t->pool; pre->base = (uint8_t *)t->mem; pre->size = t->L.size; pre->td = t->d; pre->lsz = ls; pre->layers = layers; pre->nlev = (unsigned)d.mipmapLevelCount; pre->ntw = ntw_; pre->nth = nth_;
++            pre->nchunks = (t->L.size + 0xFFFF) >> 16; uint8_t *bits_ = calloc(1, (size_t)((pre->nchunks + 7) / 8));
++            if (!bits_) pre = nil;
++            else { nvn_sparse_chunks(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, bits_); __block uint64_t cnt_ = 0; SpInfo *p_ = pre;
++                for (uint64_t i = 0; i < p_->nchunks; i++) if (bits_[i >> 3] >> (i & 7) & 1) sp_chunk_regions(p_, i, ^(unsigned l, unsigned y, MTLRegion rg, uint64_t tiles, int kind) { (void)rg;
++                    if (kind == 1) { NSUInteger key = (NSUInteger)l * p_->layers + y; if ([p_->mapped containsIndex:key]) return; [p_->mapped addIndex:key]; }
++                    if (kind == 2) { if ([p_->tailDone containsIndex:y]) return; [p_->tailDone addIndex:y]; }
++                    cnt_ += tiles; });
++                free(bits_); need = cnt_;
++                uint64_t l0_ = (uint64_t)((t->d.width + ts.width - 1) / ts.width) * ((t->d.height + ts.height - 1) / ts.height), cap_ = 640; { const char *e_ = getenv("S2A_VT_ROOM_MB"); if (e_ && *e_) cap_ = strtoull(e_, NULL, 10); }
++                cap_ = (cap_ << 20) / tileBytes; room_tiles = layers > 1 ? MIN(12 * l0_, cap_) : MIN((64ull << 20) / tileBytes, cap_); } } }
+     uint64_t slack_pct = 40; {   /* 20: a heap's size counts toward the ~18 GB device allocation Metal allows (Mario Kart World's buffers failed to create at 18.1 - 18.3 GB with 4.3 GB of heaps at 50 %) */ const char *e = getenv("S2A_SPARSE_SLACK"); if (e && *e) slack_pct = strtoull(e, NULL, 10); }
+     uint64_t bytes = (need + need * slack_pct / 100 + (gpu ? 64 : 2048)) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // slack, whole MB
++    if (pre) { bytes = (need + MAX(need * slack_pct / 100, room_tiles) + 64) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull; }   // S2Arm (fork)
+     if (!gpu || vt_cna(t)) { static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_MEM_GUARD"); on_ = !(e_ && !strcmp(e_, "0")); }
+         uint64_t cur = g_dev.currentAllocatedSize, lim = 17600ull << 20;   // S2Arm (fork): the old heap is still counted in cur
+         if (on_ && cur + bytes > lim) { uint64_t minb = (need + need / 20 + 2048) * tileBytes; uint64_t room = lim > cur ? lim - cur : 0; uint64_t nb = room > minb ? room : minb; nb = (nb + 0xFFFFF) & ~0xFFFFFull;
+@@ -3295,6 +3337,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+     uint64_t al2 = g_dev.currentAllocatedSize;
+     SpInfo *spi = [SpInfo new]; spi->hbytes = bytes; atomic_fetch_add(&g_sp_live_bytes, bytes); atomic_fetch_add(&g_sp_live_n, 1); atomic_fetch_add(&g_sp_created, 1); spi->heap = hp; spi->cap = bytes / tileBytes; spi->tileBytes = tileBytes; spi->tw = ts.width; spi->th = ts.height; spi->tailFirst = tailFirst; spi->tailTiles = tailTiles; spi->tailDone = [NSMutableIndexSet indexSet]; spi->mapped = [NSMutableIndexSet indexSet];
+     spi->pool = t->pool; spi->base = (uint8_t *)t->mem; spi->size = t->L.size; spi->td = t->d; spi->lsz = ls; spi->layers = layers; spi->nlev = (unsigned)d.mipmapLevelCount; spi->gpu = gpu;
++    if (pre) { spi->cbits = calloc(1, (size_t)((pre->nchunks + 7) / 8)); if (spi->cbits) { spi->tg = 1; spi->ntw = pre->ntw; spi->nth = pre->nth; spi->nchunks = pre->nchunks; } }   // S2Arm (fork): mapped tile by tile
+     objc_setAssociatedObject(mt, &g_sp_key, spi, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+     if (!g_sp_all) g_sp_all = [NSHashTable weakObjectsHashTable];
+     [g_sp_all addObject:mt];
+@@ -3309,8 +3352,48 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+ // Maps the tiles of every level and layer that holds mapped pages and has none yet, in one submission on a classic Metal queue (the Metal 4 queue's updateTextureMappings crashed inside
+ //   Metal on this OS); the tiles come from the texture's own heap. Waits for it, so the uploads / draws that follow find their tiles
+ static id<MTLCommandQueue> g_qs;
++// S2Arm (fork): the chunks mapped since the last look get their tiles, those unmapped give them back (see sp_tg_on); one submission on the classic queue, waited for, as sparse_map_pending
++static void sparse_map_tiles(SpInfo *s, id<MTLTexture> mt) {
++    uint64_t g = nvn_sparse_gen(); if (s->scan_gen == g + 1) return;   // scan_gen: the generation looked at + 1 (0: never)
++    size_t nb = (size_t)((s->nchunks + 7) / 8); uint8_t *nw = calloc(1, nb); if (!nw) return;
++    nvn_sparse_chunks(s->pool, (uint64_t)(uintptr_t)s->base, s->size, nw); s->scan_gen = g + 1;
++    static int unmap_ = -1; if (unmap_ < 0) { const char *e = getenv("S2A_VT_UNMAP"); unmap_ = !(e && !strcmp(e, "0")); }
++    @autoreleasepool {
++        __block id<MTLCommandBuffer> cb = nil; __block id<MTLResourceStateCommandEncoder> en = nil; __block uint64_t nmap = 0, nun = 0, tmap = 0, tun = 0; __block int bad = 0; uint64_t full = 0;
++        uint64_t am0 = g_dev.currentAllocatedSize;
++        int (^opn)(void) = ^int { if (en) return 1; if (bad) return 0; if (!g_qs) g_qs = [g_dev newCommandQueue]; cb = g_qs ? [g_qs commandBuffer] : nil; en = cb ? [cb resourceStateCommandEncoder] : nil; if (!en) bad = 1; return en != nil; };
++        for (int pass = unmap_ ? 0 : 1; pass < 2; pass++)
++            for (size_t i = 0; i < nb; i++) { uint8_t df = s->cbits[i] ^ nw[i]; if (!df) continue;
++                for (int q = 0; q < 8; q++) { if (!(df >> q & 1)) continue;
++                    uint64_t idx = (uint64_t)i * 8 + q; int was = s->cbits[i] >> q & 1;
++                    if (pass == 0 && was) {
++                        sp_chunk_regions(s, idx, ^(unsigned l, unsigned y, MTLRegion rg, uint64_t tiles, int kind) { if (kind || !opn()) return;
++                            [en updateTextureMapping:mt mode:MTLSparseTextureMappingModeUnmap region:rg mipLevel:l slice:y]; s->used -= MIN(s->used, tiles); tun += tiles; nun++; });
++                        if (!bad) s->cbits[i] &= (uint8_t)~(1u << q);
++                    } else if (pass == 1 && !was) { __block int ok = 1;
++                        sp_chunk_regions(s, idx, ^(unsigned l, unsigned y, MTLRegion rg, uint64_t tiles, int kind) { if (!ok) return;
++                            NSUInteger key = (NSUInteger)l * s->layers + y;
++                            if (kind == 1 && [s->mapped containsIndex:key]) return;
++                            if (kind == 2 && [s->tailDone containsIndex:y]) return;
++                            if (s->used + tiles > s->cap || !opn()) { ok = 0; return; }
++                            [en updateTextureMapping:mt mode:MTLSparseTextureMappingModeMap region:rg mipLevel:l slice:y];
++                            if (kind == 1) [s->mapped addIndex:key];
++                            if (kind == 2) [s->tailDone addIndex:y];
++                            s->used += tiles; tmap += tiles; nmap++; });
++                        if (ok) s->cbits[i] |= (uint8_t)(1u << q); else full++; } } }
++        if (en) { [en endEncoding]; [cb commit]; [cb waitUntilCompleted]; }
++        static uint64_t said, said_full, tot_map, tot_un; tot_map += tmap; tot_un += tun;
++        if ((nmap || nun) && (said++ < 60 || said % 300 == 0)) MLOG("[sparse-tiles] %ux%ux%u format %#x: %llu regions mapped (%llu tiles, %llu MB), %llu given back (%llu tiles); %llu of %llu tiles used; device allocation %+lld MB, now %llu MB; %llu MB mapped and %llu MB given back in all",
++            s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)nmap, (unsigned long long)tmap, (unsigned long long)((tmap * s->tileBytes) >> 20), (unsigned long long)nun, (unsigned long long)tun, (unsigned long long)s->used, (unsigned long long)s->cap,
++            (long long)((int64_t)(g_dev.currentAllocatedSize - am0) >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)((tot_map * s->tileBytes) >> 20), (unsigned long long)((tot_un * s->tileBytes) >> 20));
++        if (full && (said_full++ < 40 || said_full % 300 == 0)) MLOG("【红】 [sparse-tiles] %ux%ux%u format %#x: no room in its heap for %llu chunks (%llu of %llu tiles used): they stay unmapped and read zero (%llu times so far)",
++            s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)full, (unsigned long long)s->used, (unsigned long long)s->cap, (unsigned long long)said_full);
++    }
++    free(nw);
++}
+ static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt) {
+     if (!spi || !spi->heap) return;
++    if (spi->tg) { sparse_map_tiles(spi, mt); return; }   // S2Arm (fork)
+     @autoreleasepool {
+         uint32_t nl = spi->td.levels ? spi->td.levels : 1;
+         id<MTLCommandBuffer> cb = nil; id<MTLResourceStateCommandEncoder> en = nil;

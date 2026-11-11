@@ -1,0 +1,16 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 135e536..e93287e 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -3849,9 +3849,9 @@ static void vpool_unpublish(struct vpool *v) {   // caller holds g_vp_mu
+ }
+ // 弱链接[nvntest]：s2a_vp_arena_map（虚拟池区，runtime/src/vawin.c；NVN 单测不链原生层，链接行按这行放行未定义，runtime/build.mk 自动收）
+ // 弱链接[nvntest]：s2a_vp_arena_has（同上）
+-void *s2a_vp_arena_map(uint64_t len) __attribute__((weak)); int s2a_vp_arena_has(const void *p, uint64_t n) __attribute__((weak));
++void *s2a_vp_arena_map(uint64_t len) __attribute__((weak)); int s2a_vp_arena_has(const void *p, uint64_t n) __attribute__((weak)); void s2a_vp_arena_free(const void *p, uint64_t len) __attribute__((weak));
+ static void vpool_unmap_range(uint8_t *base, uint64_t len) {   // 虚拟池区里的盖回不可访问（区不还系统），其余照常 munmap
+-    if (s2a_vp_arena_has && s2a_vp_arena_has(base, len)) mmap(base, len, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); else munmap(base, len);
++    if (s2a_vp_arena_has && s2a_vp_arena_has(base, len)) { mmap(base, len, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0); if (s2a_vp_arena_free) s2a_vp_arena_free(base, len); } else munmap(base, len);
+ }
+ static struct vpool *vpool_new(const pool_t *o, uint8_t *a, uint64_t len) {   // 建页表、登记（录时 vpool_reserve、回放 s2a_hle_vpool_load 共用）
+     struct vpool *v = calloc(1, sizeof *v);

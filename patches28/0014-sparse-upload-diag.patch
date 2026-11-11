@@ -1,0 +1,30 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 03f6f6e..43316df 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3304,14 +3304,14 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+         //   Whole-texture buffers (a copy and a staging area the size of the texture, 0.4 - 1.5 GB for Mario Kart World's virtual textures) took the process over iOS's 8 GB limit.
+         //   Unmapped pages read as zero: a level with no page behind it is simply left as created.
+         up_begin();
+-        uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0;
++        uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; int sp_ok = 1; uint64_t sp_bytes = 0, sp_lvls = 0, sp_max = 0, sp_all = 0;
+         for (unsigned l = 0; sp_ok && l < d.mipmapLevelCount; l++) {
+             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
+             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
+             for (unsigned y = 0; sp_ok && y < layers; y++) {
+                 uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
+                 if (hi <= lo || hi > t->L.size || !nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo)) continue;
+-                size_t n = (size_t)(hi - lo); uint8_t *tmp = big_alloc(n);
++                size_t n = (size_t)(hi - lo); sp_lvls++; sp_all += n; if (n > sp_max) sp_max = n; uint8_t *tmp = big_alloc(n);
+                 if (!tmp) { static int said_sp; if (!said_sp++) MLOG("【红】 sparse texture ser=%llu level %u: cannot allocate %zu bytes: level left as created", (unsigned long long)t->serial, l, n); continue; }
+                 nvn_sparse_copy(t->pool, tmp, (uint64_t)(uintptr_t)t->mem + lo, n);
+                 size_t up = (size_t)w * ubpp, sz = unp ? up * h * z : pitch * rows * z;
+@@ -3332,6 +3332,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+             }
+         }
+         g_bp_up_bytes += sp_bytes;
++        if (t->L.size >= (256ull << 20)) { static int said_spd; if (said_spd++ < 40) MLOG("[sparse-up] ser=%llu %ux%u layers %u levels %u size %llu MB: %llu level-layers hold mapped pages = %llu MB (largest %llu MB), uploaded %llu MB",
++            (unsigned long long)t->serial, t->d.width, t->d.height, layers, nl, (unsigned long long)(t->L.size >> 20), (unsigned long long)sp_lvls, (unsigned long long)(sp_all >> 20), (unsigned long long)(sp_max >> 20), (unsigned long long)(sp_bytes >> 20)); }
+         up_flush();
+         return mt;
+     }

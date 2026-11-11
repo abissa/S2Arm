@@ -1,0 +1,23 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index f7cc405..ed4a65c 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4025,6 +4025,18 @@ static void phs_note(struct vpool *v, uint64_t voff, uint64_t size, const uint8_
+         if (!have) { int i = s->n < PHS_E ? s->n++ : s->next++ % PHS_E; s->e[i].pool = v->pool; s->e[i].va = va; }
+     }
+ }
++// S2Arm (fork): the other places (virtual addresses) that map the physical memory behind va now; up to max of them
++int nvn_sparse_places(const void *pool, const uint8_t *va, const uint8_t **out, int max) {
++    int n = 0; vp_lock();
++    struct vpool *v = g_phs ? vpool_at(pool, (uint64_t)(uintptr_t)va) : NULL;
++    if (v && va >= v->base) { const vpte *pe = vpt_get(v, (uint64_t)(va - v->base)); const uint8_t *key = pe ? pe->phys : NULL;
++        if (key) { uint32_t h = (uint32_t)(((uintptr_t)key >> 16) * 0x9E3779B1u) & (PHS_N - 1); struct phs *s = NULL;
++            for (int p = 0; p < 64 && !s; p++) { struct phs *q = &g_phs[(h + (uint32_t)p) & (PHS_N - 1)]; if (q->phys == key) s = q; else if (!q->phys) break; }
++            for (int i = 0; s && i < s->n && n < max; i++) { if (s->e[i].va == va) continue;
++                struct vpool *o = vpool_at(s->e[i].pool, (uint64_t)(uintptr_t)s->e[i].va); if (!o || s->e[i].va < o->base) continue;
++                const vpte *qe = vpt_get(o, (uint64_t)(s->e[i].va - o->base)); if (qe && qe->phys == key) out[n++] = s->e[i].va; } } }
++    vp_unlock(); return n;
++}
+ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp_mu; → 0 on failure
+     uint64_t pg = (uint64_t)getpagesize();
+     if (r->voff < 0 || (uint64_t)r->voff + r->size > v->size) { LOG("【红】 virtual pool %p: request at %#llx+%#llx is beyond the pool's %#llx", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)v->size); return 0; }

@@ -1,0 +1,14 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_geometry.inc b/graphics/nvn/gfx/nvn/nvn_geometry.inc
+index 4279f97..2c74841 100644
+--- a/graphics/nvn/gfx/nvn/nvn_geometry.inc
++++ b/graphics/nvn/gfx/nvn/nvn_geometry.inc
+@@ -126,6 +126,9 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
+     if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &mk, g_pso_mtk_building); }
+     os_unfair_lock_unlock(&g_pso_mtk_lock);
+     if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
++    // S2Arm (fork): integer attachments the library's entry points do not match (Mario Kart World's mesh pipeline of fragment dcb0504c844f1ecc writes float4 to an R8Uint target and Metal refused it, so its draws
++    //   were skipped): ask for the device-translated typed-output variant first, as the vertex path does (pso_get_vs: it skipped mesh pipelines, ms_fn)
++    if (fs && !g_pso_fsfn && pso_fout_variant(raster, fs, k, merged)) MLOG("task / mesh pipeline: typed-output variant of fragment %s built for mesh %s", fs->key, ms->key);
+     MTLRenderPipelineDescriptor *d = pso_desc(k, ms, fs, g_pso_fsfn, merged);   // the fragment function variant and the attachments, as a vertex draw's
+     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+     m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;

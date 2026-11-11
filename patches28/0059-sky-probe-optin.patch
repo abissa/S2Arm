@@ -1,0 +1,12 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index a3ab18a..26992bc 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -14265,6 +14265,7 @@ static void cull_report(uint64_t fr) {
+     memset(g_dg_n, 0, sizeof g_dg_n); memset(g_dg_first, 0, sizeof g_dg_first); memset(g_dg_empty, 0, sizeof g_dg_empty); memset(g_dg_ind, 0, sizeof g_dg_ind);
+ }
+ static void sky_probe(uint64_t fr) {
++    { static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_SKY_PROBE"); on_ = e_ && !strcmp(e_, "1"); } if (!on_) return; }   // the read-back waits for the GPU (a stutter every 1200 frames): only with S2A_SKY_PROBE=1
+     static uint64_t last; if (fr < 600 || fr / 1200 == last) return; last = fr / 1200;
+     if (g_m3 || !g_q4 || !g_dev) return;
+     uint64_t sers[8]; int ns = 0, cands = 0;

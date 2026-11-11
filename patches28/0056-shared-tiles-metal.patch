@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 278093c..9a1bbe7 100644
+index 278093c..b6cdc1f 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -303,9 +303,10 @@ static void big_tex_res(id<MTLResource> r, int line) {
@@ -19,7 +19,7 @@ index 278093c..9a1bbe7 100644
      }
  }
  static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt);
-+// ===================== S2Arm (fork): shared tiles (off unless S2A_VT_SHARE_HEAP=1) =====================
++// ===================== S2Arm (fork): shared tiles (S2A_VT_SHARE_HEAP=0 turns it off) =====================
 +// The terrain arrays of Mario Kart World are Metal placement sparse textures with 64 KB pages (as nxnative's host makes its sparse textures) whose tiles come from shared placement heaps. A tile is a slot; the slot
 +//   of a 64 KB chunk is keyed by the physical memory behind it and the texture format, so every place the game maps that memory at (the game maps one physical page at about three places) maps the same slot: a write
 +//   through one place, whether a copy, a draw or a compute store, reads at the others, as on the console. Mapping goes through the Metal 4 queue (updateTextureMappings with a heap offset), which the vt-probe showed to work
@@ -34,7 +34,7 @@ index 278093c..9a1bbe7 100644
 +static uint32_t *g_vs_free; static size_t g_vs_nfree, g_vs_freecap;
 +static struct vs_late { uint32_t slot; uint64_t fence; } *g_vs_late; static size_t g_vs_nlate, g_vs_latecap;
 +static uint64_t g_vs_live, g_vs_peak, g_vs_shared, g_vs_maps, g_vs_unmaps, g_vs_reused;
-+static int vs_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_SHARE_HEAP"); on = e && !strcmp(e, "1"); } return on && !g_m3 && g_q4 != nil; }
++static int vs_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_SHARE_HEAP"); on = !(e && !strcmp(e, "0")); } return on && !g_m3 && g_q4 != nil; }
 +#define VST(...) do { static int n_; if (n_++ < 400) MLOG("[vt-trace] " __VA_ARGS__); } while (0)
 +static inline uint32_t vs_hash(uintptr_t k, uint32_t f) { return (uint32_t)((((uint64_t)k >> 12) * 0x9E3779B1u) ^ ((uint64_t)f * 0x85EBCA6Bu)) & (VS_HN - 1); }
 +static uint32_t vs_find(uintptr_t k, uint32_t f) {   // caller holds g_vs_mu

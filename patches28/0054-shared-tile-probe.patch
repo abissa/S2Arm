@@ -1,0 +1,57 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index c4ae6bb..278093c 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3271,7 +3271,52 @@ static void sp_chunk_regions(SpInfo *s, uint64_t idx, sp_rg_blk blk) {
+     }
+ }
+ static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt);
++// S2Arm (fork) PROBE (once, S2A_VT_PROBE=0 turns it off): can one heap tile be mapped into two placement sparse textures through the Metal 4 queue (updateTextureMappings with a heap offset, as
++//   the nxnative host does for its shared tiles), and does a write through one place read back through the other? A placement heap of 1 MB, two 256x256 RGBA8 textures with 64 KB sparse pages;
++//   the tile at (0,0) of the first and the tile at (1,1) of the second both map heap offset 0; a pattern is copied into the first and read back from the second. The result is logged as [vt-probe]
++static void vt_probe(void) {
++    static int done; if (done++) return;
++    { const char *e = getenv("S2A_VT_PROBE"); if (e && !strcmp(e, "0")) return; }
++    if (g_m3 || !g_q4 || !g_dev) { MLOG("[vt-probe] skipped: no Metal 4 queue here"); return; }
++    if (@available(macOS 26.0, iOS 26.0, *)) { @autoreleasepool {
++        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        MLOG("[vt-probe] start: placement heap + two placement sparse textures, one heap tile mapped into both through the Metal 4 queue");
++        MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.storageMode = MTLStorageModePrivate; hd.size = 1u << 20; hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
++        id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd];
++        if (!h) { MLOG("[vt-probe] FAILED: no placement heap with 64 KB sparse pages"); return; }
++        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:256 height:256 mipmapped:NO];
++        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView; d.placementSparsePageSize = MTLSparsePageSize64; d.allowGPUOptimizedContents = NO;
++        id<MTLTexture> a = [g_dev newTextureWithDescriptor:d], b = [g_dev newTextureWithDescriptor:d];
++        if (!a || !b) { MLOG("[vt-probe] FAILED: no placement sparse texture (a %d, b %d)", a != nil, b != nil); return; }
++        id<MTLBuffer> src = [g_dev newBufferWithLength:65536 options:MTLResourceStorageModeShared], dst = [g_dev newBufferWithLength:65536 options:MTLResourceStorageModeShared];
++        if (!src || !dst) { MLOG("[vt-probe] FAILED: no buffers"); return; }
++        uint8_t *sp = src.contents; for (int i = 0; i < 65536; i++) sp[i] = (uint8_t)(i * 7 + 3); memset(dst.contents, 0, 65536);
++        res_add(h); res_add(a); res_add(b); res_add(src); res_add(dst); res_commit();
++        MTL4UpdateSparseTextureMappingOperation m0 = {MTLSparseTextureMappingModeMap, MTLRegionMake3D(0, 0, 0, 1, 1, 1), 0, 0, 0}, m1 = {MTLSparseTextureMappingModeMap, MTLRegionMake3D(1, 1, 0, 1, 1, 1), 0, 0, 0};
++        [g_q4 updateTextureMappings:a heap:h operations:&m0 count:1];
++        [g_q4 updateTextureMappings:b heap:h operations:&m1 count:1];
++        MLOG("[vt-probe] both mapping updates issued (%.1f ms)", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
++        MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new]; NSError *ae = nil; id<MTL4CommandAllocator> al = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae];
++        id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
++        if (!al || !cb) { MLOG("[vt-probe] FAILED: no command allocator / buffer"); return; }
++        [cb beginCommandBufferWithAllocator:al];
++        id e = enc_c_begin_on(cb, YES);
++        enc_b_copy_buffer_texture(e, src, 0, 512, 65536, MTLSizeMake(128, 128, 1), a, 0, 0, MTLOriginMake(0, 0, 0));
++        [(id<MTL4ComputeCommandEncoder>)e barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
++        [e copyFromTexture:b sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(128, 128, 0) sourceSize:MTLSizeMake(128, 128, 1) toBuffer:dst destinationOffset:0 destinationBytesPerRow:512 destinationBytesPerImage:65536];
++        enc_end_on(e, YES);
++        [cb endCommandBuffer];
++        dispatch_semaphore_t sem = dispatch_semaphore_create(0); __block int err = 0;
++        id o = fb_new(); fb_add(o, ^(id<MTL4CommitFeedback> f) { if (f.error) err = 1; dispatch_semaphore_signal(sem); });
++        id<MTL4CommandBuffer> bufs[] = {cb}; [g_q4 commit:bufs count:1 options:o];
++        long to = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
++        uint8_t *dp = dst.contents; int bad = 0, zeros = 0; for (int i = 0; i < 65536; i++) { bad += dp[i] != (uint8_t)(i * 7 + 3); zeros += dp[i] == 0; }
++        MLOG("[vt-probe] RESULT: %s%s; %d of 65536 bytes differ from the pattern written through the other texture (%d zero bytes); first bytes %02x %02x %02x %02x; %.1f ms in all",
++             to ? "TIMED OUT; " : "", err ? "GPU ERROR" : bad ? "the second texture does NOT show the first's write" : "SHARED TILE WORKS: a write through one place reads back through the other", bad, zeros, dp[0], dp[1], dp[2], dp[3], (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
++    } }
++}
+ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int gpu) {   // nil = not a texture for this (create it whole, as before)
++    vt_probe();
+     if (!g_q4 || !g_dev || !t->pool || !nvn_sparse_pool(t->pool)) return nil;
+     if (d.textureType != MTLTextureType2D && d.textureType != MTLTextureType2DArray) return nil;
+     if (d.sampleCount > 1) return nil;

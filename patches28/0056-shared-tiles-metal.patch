@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 278093c..7990d67 100644
+index 278093c..7e0b20f 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -303,9 +303,10 @@ static void big_tex_res(id<MTLResource> r, int line) {
@@ -15,11 +15,11 @@ index 278093c..7990d67 100644
  @end
  static const char g_sp_key = 0;
  static SpInfo *sp_info(id r) { return r ? objc_getAssociatedObject(r, &g_sp_key) : nil; }
-@@ -3271,6 +3272,164 @@ static void sp_chunk_regions(SpInfo *s, uint64_t idx, sp_rg_blk blk) {
+@@ -3271,6 +3272,175 @@ static void sp_chunk_regions(SpInfo *s, uint64_t idx, sp_rg_blk blk) {
      }
  }
  static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt);
-+// ===================== S2Arm (fork): shared tiles (S2A_VT_SHARE_HEAP=0 turns it off) =====================
++// ===================== S2Arm (fork): shared tiles (off unless S2A_VT_SHARE_HEAP=1) =====================
 +// The terrain arrays of Mario Kart World are Metal placement sparse textures with 64 KB pages (as nxnative's host makes its sparse textures) whose tiles come from shared placement heaps. A tile is a slot; the slot
 +//   of a 64 KB chunk is keyed by the physical memory behind it and the texture format, so every place the game maps that memory at (the game maps one physical page at about three places) maps the same slot: a write
 +//   through one place, whether a copy, a draw or a compute store, reads at the others, as on the console. Mapping goes through the Metal 4 queue (updateTextureMappings with a heap offset), which the vt-probe showed to work
@@ -34,7 +34,8 @@ index 278093c..7990d67 100644
 +static uint32_t *g_vs_free; static size_t g_vs_nfree, g_vs_freecap;
 +static struct vs_late { uint32_t slot; uint64_t fence; } *g_vs_late; static size_t g_vs_nlate, g_vs_latecap;
 +static uint64_t g_vs_live, g_vs_peak, g_vs_shared, g_vs_maps, g_vs_unmaps, g_vs_reused;
-+static int vs_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_SHARE_HEAP"); on = !(e && !strcmp(e, "0")); } return on && !g_m3 && g_q4 != nil; }
++static int vs_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("S2A_VT_SHARE_HEAP"); on = e && !strcmp(e, "1"); } return on && !g_m3 && g_q4 != nil; }
++#define VST(...) do { static int n_; if (n_++ < 400) MLOG("[vt-trace] " __VA_ARGS__); } while (0)
 +static inline uint32_t vs_hash(uintptr_t k, uint32_t f) { return (uint32_t)((((uint64_t)k >> 12) * 0x9E3779B1u) ^ ((uint64_t)f * 0x85EBCA6Bu)) & (VS_HN - 1); }
 +static uint32_t vs_find(uintptr_t k, uint32_t f) {   // caller holds g_vs_mu
 +    if (!g_vs_h) return ~0u;
@@ -59,7 +60,9 @@ index 278093c..7990d67 100644
 +    g_vs_nlate = k;
 +    if (!g_vs_nfree) {
 +        MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.storageMode = MTLStorageModePrivate; hd.size = (NSUInteger)VS_HEAP_TILES * 65536u; hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
++        VST("vs_alloc making heap %lu", (unsigned long)g_vs_heaps.count + 1);
 +        id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd];
++        VST("vs_alloc heap made: %d", h != nil);
 +        if (!h) { { static int n_; if (n_++ < 4) MLOG("【红】 shared tiles: cannot make a 256 MB placement heap (%llu tiles live)", (unsigned long long)g_vs_live); } return 0; }
 +        if (!g_vs_heaps) g_vs_heaps = [NSMutableArray array];
 +        uint32_t base = (uint32_t)g_vs_heaps.count * VS_HEAP_TILES; [g_vs_heaps addObject:h]; res_add(h);
@@ -80,6 +83,7 @@ index 278093c..7990d67 100644
 +}
 +static void vs_dealloc(SpInfo *s) {
 +    if (!s->sh) return;
++    VST("vs_dealloc %ux%ux%u", s->td.width, s->td.height, s->layers);
 +    pthread_mutex_lock(&g_vs_mu);
 +    if (s->sslot) for (uint64_t i = 0; i < s->nchunks; i++) if (s->sslot[i]) vs_release(s->sslot[i] - 1);
 +    pthread_mutex_unlock(&g_vs_mu);
@@ -109,7 +113,9 @@ index 278093c..7990d67 100644
 +static void sparse_map_shared(SpInfo *s, id<MTLTexture> mt) {
 +    uint64_t g = nvn_sparse_gen(); if (s->scan_gen == g + 1) return;
 +    if (!s->skey) return;
++    VST("map_shared enter %ux%ux%u fmt %#x gen %llu", s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)g);
 +    uint64_t changed = nvn_sparse_chunk_keys(s->pool, (uint64_t)(uintptr_t)s->base, s->size, s->skey, s->nkey); s->scan_gen = g + 1;
++    VST("map_shared keys done: %llu chunks changed", (unsigned long long)changed);
 +    if (!changed) return;
 +    if (@available(macOS 26.0, iOS 26.0, *)) { @autoreleasepool {
 +        vs_ops un = {0}; vs_ops *mp = NULL; uint32_t nh = 0; uint64_t nmap = 0, nun = 0, nsh = 0, nfail = 0;
@@ -129,8 +135,9 @@ index 278093c..7990d67 100644
 +            s->sslot[i] = slot + 1; nmap++;
 +        }
 +        pthread_mutex_unlock(&g_vs_mu);
++        VST("map_shared ops built: %zu unmaps, %u heaps", un.n, nh);
 +        if (un.n) [g_q4 updateTextureMappings:mt heap:nil operations:un.op count:un.n];   // the unmaps first: a chunk moving to another slot is unmapped, then mapped
-+        for (uint32_t h = 0; h < nh; h++) if (mp[h].n) [g_q4 updateTextureMappings:mt heap:mp[h].heap operations:mp[h].op count:mp[h].n];
++        for (uint32_t h = 0; h < nh; h++) if (mp[h].n) { VST("map_shared heap %u: %zu maps", h, mp[h].n); [g_q4 updateTextureMappings:mt heap:mp[h].heap operations:mp[h].op count:mp[h].n]; VST("map_shared heap %u issued", h); }
 +        g_vs_maps += nmap; g_vs_unmaps += nun;
 +        free(un.op); for (uint32_t h = 0; h < nh; h++) free(mp[h].op); free(mp);
 +        static uint64_t said; if ((nmap || nun || nfail) && (said++ < 80 || said % 200 == 0))
@@ -150,6 +157,7 @@ index 278093c..7990d67 100644
 +// A GPU sparse texture of a terrain pool as a placement sparse texture of shared tiles; nil: not eligible (Metal's 64 KB tile must be the NVN tile, whole layers of 64 KB chunks, a mip tail of one tile): the old path
 +static id<MTLTexture> vs_create(const tex_t *t, MTLTextureDescriptor *d) {
 +    if (!vs_on() || !t->pool) return nil;
++    VST("vs_create enter ser=%llu %ux%u format %#x", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
 +    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
 +    uint32_t tbw = bpb == 16 ? 64 : bpb == 8 || bpb == 4 ? 128 : 0, tbh = bpb == 16 || bpb == 8 ? 64 : bpb == 4 ? 128 : 0; if (!tbw) return nil;
 +    uint32_t ntw = tbw * (uint32_t)bw, nth = tbh * (uint32_t)bh; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; if (!ls || (ls & 0xFFFF)) return nil;
@@ -159,7 +167,9 @@ index 278093c..7990d67 100644
 +        if (ts.width != ntw || ts.height != nth) { static int n_; if (n_++ < 6) MLOG("[vt-heap] ser=%llu format %#x: Metal's 64 KB tile is %lux%lu, NVN's %ux%u: old path", (unsigned long long)t->serial, t->d.format, (unsigned long)ts.width, (unsigned long)ts.height, ntw, nth); goto vs_done; }
 +        MTLTextureDescriptor *sd = [d copy]; sd.storageMode = MTLStorageModePrivate; sd.hazardTrackingMode = MTLHazardTrackingModeUntracked; sd.allowGPUOptimizedContents = NO; sd.placementSparsePageSize = MTLSparsePageSize64;
 +        sd.usage |= MTLTextureUsagePixelFormatView | (bw > 1 || bh > 1 ? 0 : MTLTextureUsageRenderTarget);
++        VST("vs_create making the texture");
 +        mt = [g_dev newTextureWithDescriptor:sd];
++        VST("vs_create texture made: %d", mt != nil);
 +        if (!mt) { static int n_; if (n_++ < 6) MLOG("[vt-heap] ser=%llu: cannot make the placement sparse texture: old path", (unsigned long long)t->serial); goto vs_done; }
 +        uint32_t nl = t->d.levels ? t->d.levels : 1; NSUInteger tf = mt.firstMipmapInTail;
 +        if (tf < nl && mt.tailSizeInBytes != 65536) { static int n_; if (n_++ < 6) MLOG("[vt-heap] ser=%llu: the mip tail is %lu bytes, not one 64 KB tile: old path", (unsigned long long)t->serial, (unsigned long)mt.tailSizeInBytes); mt = nil; goto vs_done; }
@@ -174,13 +184,14 @@ index 278093c..7990d67 100644
 +            (unsigned long)d.mipmapLevelCount, (unsigned long long)(t->L.size >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long)tf, (unsigned long long)spi->nchunks);
 +    } }
 +vs_done:
-+    if (mt && spi) { res_add(mt); sparse_map_shared(spi, mt); }
++    VST("vs_create done: %d, mapping now", mt != nil);
++    if (mt && spi) { res_add(mt); VST("vs_create res_add done"); sparse_map_shared(spi, mt); VST("vs_create mapped"); }
 +    return mt;
 +}
  // S2Arm (fork) PROBE (once, S2A_VT_PROBE=0 turns it off): can one heap tile be mapped into two placement sparse textures through the Metal 4 queue (updateTextureMappings with a heap offset, as
  //   the nxnative host does for its shared tiles), and does a write through one place read back through the other? A placement heap of 1 MB, two 256x256 RGBA8 textures with 64 KB sparse pages;
  //   the tile at (0,0) of the first and the tile at (1,1) of the second both map heap offset 0; a pattern is copied into the first and read back from the second. The result is logged as [vt-probe]
-@@ -3325,6 +3484,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+@@ -3325,6 +3495,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
      if (![g_dev supportsFamily:MTLGPUFamilyApple6]) return nil;
      { static int probed; if (!probed++) { const char *e = getenv("S2A_SPARSE_PROBE"); int mb = e ? atoi(e) : 0;   // does a big, empty sparse heap cost memory? (watch the process footprint)
          if (mb > 0) { uint64_t a0 = g_dev.currentAllocatedSize; static id<MTLHeap> keep; keep = sp_heap((NSUInteger)mb << 20); MLOG("[sparse-probe] an empty sparse heap of %d MB: %s, device allocation %+lld MB (kept alive)", mb, keep ? "created" : "FAILED", (long long)((int64_t)(g_dev.currentAllocatedSize - a0) >> 20)); } } }
@@ -188,7 +199,7 @@ index 278093c..7990d67 100644
      NSUInteger tileBytes = g_dev.sparseTileSizeInBytes; if (!tileBytes) return nil;
      MTLSize ts = [g_dev sparseTileSizeWithTextureType:d.textureType pixelFormat:d.pixelFormat sampleCount:1];
      if (!ts.width || !ts.height) return nil;
-@@ -3439,6 +3599,7 @@ static void sparse_map_tiles(SpInfo *s, id<MTLTexture> mt) {
+@@ -3439,6 +3610,7 @@ static void sparse_map_tiles(SpInfo *s, id<MTLTexture> mt) {
      free(nw);
  }
  static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt) {
@@ -196,7 +207,7 @@ index 278093c..7990d67 100644
      if (!spi || !spi->heap) return;
      if (spi->tg) { sparse_map_tiles(spi, mt); return; }   // S2Arm (fork)
      @autoreleasepool {
-@@ -3515,6 +3676,7 @@ static void sp_share_run(void) {
+@@ -3515,6 +3687,7 @@ static void sp_share_run(void) {
      sp_share_t *jobs; uint32_t n;
      os_unfair_lock_lock(&g_sps_lk); jobs = g_sps; n = g_sps_n; g_sps = NULL; g_sps_n = g_sps_cap = 0; atomic_store(&g_sps_pending, 0); os_unfair_lock_unlock(&g_sps_lk);
      if (!jobs) return;
@@ -204,7 +215,7 @@ index 278093c..7990d67 100644
      static uint64_t done, miss, tails, same; int began = 0; static uint64_t m_src, m_dst, m_shape, m_enc;
      for (uint32_t i = 0; i < n && g_sp_all; i++) { sp_place s, d;
          { int ls_ = sp_locate(jobs[i].src, &s), ld_ = sp_locate(jobs[i].dst, &d);   // S2Arm (fork) diag: which side has no place, and where it lies
-@@ -3552,7 +3714,7 @@ static id<MTLTexture> tex_mtl(const tex_t *ct);
+@@ -3552,7 +3725,7 @@ static id<MTLTexture> tex_mtl(const tex_t *ct);
  static void sp_propagate(const p_copy_t2t *c) {
      if (!c->dst || !c->dst->pool || !(c->dst->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || !g_sp_all) return;
      id<MTLTexture> mt = tex_mtl(c->dst); while (mt.parentTexture) mt = mt.parentTexture;
@@ -213,7 +224,7 @@ index 278093c..7990d67 100644
      unsigned level = c->has_dv && c->dv.set_levels ? (unsigned)c->dv.base_level : 0, layer0 = (c->has_dv && c->dv.set_layers ? (unsigned)c->dv.min_layer : 0) + (unsigned)c->dr.zoffset, nlay = c->dr.depth > 0 ? (unsigned)c->dr.depth : 1;
      uint32_t nl = s->td.levels ? s->td.levels : 1; if (level >= nl || level >= s->nlev) return;
      int bw, bh, bpb = nvn_fmt_bpb(s->td.format, &bw, &bh);
-@@ -4596,7 +4758,7 @@ static void sp_tiles_report(uint64_t fr) {
+@@ -4596,7 +4769,7 @@ static void sp_tiles_report(uint64_t fr) {
               (unsigned long long)s->c_map, (unsigned long long)s->c_un, (unsigned long long)s->c_full, (unsigned long long)dg); }
  }
  static void mem_report(void) {
@@ -222,7 +233,7 @@ index 278093c..7990d67 100644
      uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
      uint64_t never_b = 0, never_n = 0;
      struct { uint64_t b, ser, idle; unsigned w, h, fmt; int cls; } top[6]; memset(top, 0, sizeof top);
-@@ -4846,7 +5008,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+@@ -4846,7 +5019,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
          res_add(mt);   // register residency before filling (the copy destination must be resident too)
          // S2Arm (fork): a very large texture of a sparse (virtual) pool holds nothing yet (Mario Kart World: 61 textures of 8192x8192, about 340 MB each, 144 KB resident): writing zeros over all of it
          //   committed the whole GPU allocation and took the process past iOS's 8 GB limit. Its pages are not written until something draws into it or the game maps data there

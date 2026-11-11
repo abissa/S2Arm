@@ -1,0 +1,16 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 8389540..9f2b9e6 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3306,6 +3306,11 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+     }
+     up_begin();
+     id<MTLBuffer> stg = [g_dev newBufferWithLength:total ? total : 16 options:MTLResourceStorageModeShared];
++    if (!stg) {   // S2Arm (fork): no staging buffer this big (a 400 MB sparse texture): left as created instead of adding nil to the keep list (NSInvalidArgumentException)
++        { static int said_stg; if (!said_stg++) MLOG("【红】 texture ser=%llu: cannot create a %llu byte staging buffer: not uploaded (first case)", (unsigned long long)t->serial, (unsigned long long)total); }
++        big_free(part, partn);
++        return mt;
++    }
+     res_add(stg); up_keep_add(stg);
+     size_t off = 0;
+     int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }

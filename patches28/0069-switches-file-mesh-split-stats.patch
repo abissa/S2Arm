@@ -1,0 +1,94 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_geometry.inc b/graphics/nvn/gfx/nvn/nvn_geometry.inc
+index 2c74841..f769b87 100644
+--- a/graphics/nvn/gfx/nvn/nvn_geometry.inc
++++ b/graphics/nvn/gfx/nvn/nvn_geometry.inc
+@@ -112,7 +112,7 @@ static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t
+ typedef struct { pso_key k; const void *ts; } mtk_key;   // pso_key with the mesh shader in its vertex place, and the task shader (the pipeline's third function)
+ static nvn_hmap g_pso_mtk = {.klen = sizeof(mtk_key)}; static os_unfair_lock g_pso_mtk_lock = OS_UNFAIR_LOCK_INIT;
+ static NSObject *g_pso_mtk_building; static dispatch_queue_t g_mtk_q; static dispatch_group_t g_mtk_group;
+-static uint64_t g_mtk_n, g_mtk_ind_n, g_mtk_wait, g_mtk_skip;   // drawn (of them indirect), skipped while the pipeline was built, skipped as not drawable (red)
++static uint64_t g_mtk_n, g_mtk_ind_n, g_mtk_wait, g_mtk_skip, g_ms_big_t, g_ms_big_nt, g_ms_split; static uint32_t g_ms_max;   // drawn (of them indirect), skipped while the pipeline was built, skipped as not drawable (red)
+ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
+     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1]; int merged = g_pso_lmap != NULL;
+     mtk_key mk; memset(&mk, 0, sizeof mk); pso_key *k = &mk.k;
+@@ -147,6 +147,13 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
+     } });
+     return nil;
+ }
++static int ms_split(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_MESH_SPLIT"); v = !(e && !strcmp(e, "0")); MLOG("task / mesh draws with no task shader and over 1024 workgroups: %s (S2A_MESH_SPLIT)", v ? "split into draws of at most 1024" : "one draw (Metal's 1024 limit applies)"); } return v; }
++static void mesh_report(uint64_t fr) {   // every 600 frames (mem_report): what the task / mesh draws did, and the switches file once
++    static int said; if (!said++ && g_sw_note[0]) MLOG("[switches] s2a_switches.txt:%s", g_sw_note);
++    if (!g_mtk_n && !g_mtk_wait && !g_mtk_skip) return;
++    MLOG("[mesh-stats] frame %llu: task / mesh draws %llu so far (indirect %llu), skipped while the pipeline was built %llu, not drawable %llu; largest direct draw %u workgroups, over 1024: with a task shader %llu, without %llu (pieces made %llu)",
++         (unsigned long long)fr, (unsigned long long)g_mtk_n, (unsigned long long)g_mtk_ind_n, (unsigned long long)g_mtk_wait, (unsigned long long)g_mtk_skip, g_ms_max, (unsigned long long)g_ms_big_t, (unsigned long long)g_ms_big_nt, (unsigned long long)g_ms_split);
++}
+ static void mtk_encode(id en_) {
+     id en = en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;
+     uint64_t first = g_mtk.ind ? g_mtk.ind + 16 : 0;   // indirect: the converted arguments carry it at word 4 (ixc_arrays)
+@@ -155,7 +162,11 @@ static void mtk_encode(id en_) {
+     if (ts) { enc_r_table(en, g_ot, MTLRenderStageObject); g_args_object = 1; encode_args(en, ts, 3, 0); g_args_object = 0; enc_o_args(first, MESH_FIRST_SLOT); }
+     encode_args(en, ms, 4, 1); enc_r_vbuf(en, MESH_FIRST_SLOT, first);
+     NSUInteger ot = ts ? ts->mesh_threads : 1, mt = ms->mesh_threads;
+-    if (g_mtk.ind) enc_r_mesh_indirect(en, g_mtk.ind, ot, mt); else enc_r_mesh(en, g_mtk.count, ot, mt);
++    if (g_mtk.ind) enc_r_mesh_indirect(en, g_mtk.ind, ot, mt);
++    else if (!ts && g_mtk.count > 1024 && ms_split()) {   // S2Arm (fork) S2A_MESH_SPLIT (default on): Metal holds a mesh grid with no object stage to 1024 threadgroups; nxnative PR #1708 split such a draw into draws of at most 1024
++        for (uint32_t off = 0; off < g_mtk.count; off += 1024) { uint32_t n_ = g_mtk.count - off < 1024 ? g_mtk.count - off : 1024, f_ = g_mtk.first + off; id<MTLBuffer> b_; size_t o_ = arena_alloc(16, &b_);
++            memcpy((uint8_t *)b_.contents + o_, &f_, 4); enc_r_vbuf(en, MESH_FIRST_SLOT, b_.gpuAddress + o_); enc_r_mesh(en, n_, ot, mt); g_ms_split++; } }
++    else enc_r_mesh(en, g_mtk.count, ot, mt);
+ }
+ static void mesh_tasks_draw(const p_draw *dw) {
+     if (!dw->ind && dw->count <= 0) return;
+@@ -189,7 +200,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
+     swrite_note(pr);   // the task / mesh stages' storage writes (draw() saw the pixel stage alone)
+     if (!g_mtk_n++) MLOG("task / mesh: first draw (%s), task %s mesh %s fragment %s, %u workgroups from %u", ind ? "indirect" : "direct", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-",
+                          g_mtk.count, g_mtk.first);
+-    if (ind) g_mtk_ind_n++;
++    if (ind) g_mtk_ind_n++; else { if (g_mtk.count > g_ms_max) g_ms_max = g_mtk.count; if (g_mtk.count > 1024) { if (ts) g_ms_big_t++; else g_ms_big_nt++; } }
+ }
+ 
+ 
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 2d9f3f2..e68afc4 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -2086,6 +2086,28 @@ static uint64_t rep_ticks(const post_op *o, seg_clk *sc, uint32_t last, uint64_t
+ static uint64_t bp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
+ static uint64_t g_bp_t0;   // Time of process start (when this module is loaded)
+ __attribute__((constructor)) static void bp_t0(void) { g_bp_t0 = bp_now(); }
++// S2Arm (fork): switches without an environment. <Documents>/s2a_switches.txt (S2A_DOCS, else $HOME/Documents) holds lines NAME=VALUE (# comments); each becomes an environment variable unless the launch already set it, so a game
++//   started from the home screen can test one switch after another by editing that file (the launch's own --env wins). Read before main; logged with the first memory report
++static char g_sw_note[700];
++__attribute__((constructor)) static void s2a_switches_load(void) {
++    const char *dd = getenv("S2A_DOCS"), *hh = getenv("HOME"); char p[1200];
++    if (dd && *dd) snprintf(p, sizeof p, "%s/s2a_switches.txt", dd); else if (hh && *hh) snprintf(p, sizeof p, "%s/Documents/s2a_switches.txt", hh); else return;
++    FILE *f = fopen(p, "r"); if (!f) return;
++    char ln[300]; size_t o = 0;
++    while (fgets(ln, sizeof ln, f)) {
++        char *s = ln; while (*s == ' ' || *s == '	') s++;
++        if (!*s || *s == '#' || *s == '
++' || *s == '') continue;
++        char *eq = strchr(s, '='); if (!eq) continue;
++        *eq = 0; char *v = eq + 1; v[strcspn(v, "
++")] = 0;
++        size_t kl = strlen(s); while (kl && (s[kl - 1] == ' ' || s[kl - 1] == '	')) s[--kl] = 0;
++        if (!*s) continue;
++        int had = getenv(s) != NULL; if (!had) setenv(s, v, 0);
++        if (o < sizeof g_sw_note - 80) o += snprintf(g_sw_note + o, sizeof g_sw_note - o, " %s=%s%s", s, v, had ? "(launch env wins)" : "");
++    }
++    fclose(f);
++}
+ static int bootprof(void) { static int v = -1; if (v < 0) v = getenv("DM_BOOTPROF") != NULL; return v; }
+ static uint64_t g_bp_lib_n, g_bp_lib_ns, g_bp_lib_wait_ns, g_bp_pso_n, g_bp_pso_ns, g_bp_up_bytes, g_bp_first_present;
+ static uint64_t g_up_total_ns;   // Cumulative upload time (same source as the per-frame @upload_ms)
+@@ -4770,9 +4792,9 @@ static void sp_tiles_report(uint64_t fr) {
+              (unsigned long long)fr, s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)s->used, (unsigned long long)s->cap, (unsigned long long)(s->hbytes >> 20), (unsigned long long)nm, (unsigned long long)s->nchunks,
+              (unsigned long long)s->c_map, (unsigned long long)s->c_un, (unsigned long long)s->c_full, (unsigned long long)dg); }
+ }
+-static void sky_probe(uint64_t fr); static void cull_report(uint64_t fr);   // S2Arm (fork) render diagnostics (defined before dispatch)
++static void sky_probe(uint64_t fr); static void cull_report(uint64_t fr); static void mesh_report(uint64_t fr);   // S2Arm (fork) render diagnostics (defined before dispatch)
+ static void mem_report(void) {
+-    uint64_t fr = atomic_load(&g_cur_frame); sp_tiles_report(fr); vs_report(fr); cull_report(fr); sky_probe(fr);
++    uint64_t fr = atomic_load(&g_cur_frame); sp_tiles_report(fr); vs_report(fr); cull_report(fr); mesh_report(fr); sky_probe(fr);
+     uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
+     uint64_t never_b = 0, never_n = 0;
+     struct { uint64_t b, ser, idle; unsigned w, h, fmt; int cls; } top[6]; memset(top, 0, sizeof top);

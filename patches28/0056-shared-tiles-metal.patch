@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index 278093c..7e0b20f 100644
+index 278093c..9a1bbe7 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -303,9 +303,10 @@ static void big_tex_res(id<MTLResource> r, int line) {
@@ -238,7 +238,7 @@ index 278093c..7e0b20f 100644
          // S2Arm (fork): a very large texture of a sparse (virtual) pool holds nothing yet (Mario Kart World: 61 textures of 8192x8192, about 340 MB each, 144 KB resident): writing zeros over all of it
          //   committed the whole GPU allocation and took the process past iOS's 8 GB limit. Its pages are not written until something draws into it or the game maps data there
 -        if (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && mt.allocatedSize >= (64u << 20)) { static int said_big; if (!said_big++) MLOG("[sparse-big] first very large sparse-pool texture ser=%llu %llu MB: not zero-filled (later ones are not logged)", (unsigned long long)t->serial, (unsigned long long)(mt.allocatedSize >> 20)); }
-+        if (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (mt.allocatedSize >= (64u << 20) || sp_info(mt))) { static int said_big; if (!said_big++) MLOG("[sparse-big] first very large sparse-pool texture ser=%llu %llu MB: not zero-filled (later ones are not logged)", (unsigned long long)t->serial, (unsigned long long)(mt.allocatedSize >> 20)); }
++        if (t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (mt.allocatedSize >= (64u << 20) || (sp_info(mt) && sp_info(mt)->sh))) { static int said_big; if (!said_big++) MLOG("[sparse-big] first very large sparse-pool texture ser=%llu %llu MB: not zero-filled (later ones are not logged)", (unsigned long long)t->serial, (unsigned long long)(mt.allocatedSize >> 20)); }
          else if (!tex_init_fill(t, mt)) tex_zero_fill(mt);
          if (big_tex_on() && mt.allocatedSize >= (4u << 20)) {   // 大贴图建立账（big_tex_res）：NVN 侧描述 + 存储有没有被游戏碰过（mincore，不读页）
              uint64_t touched = 0; size_t pg = (size_t)getpagesize(); unsigned char vec[512];

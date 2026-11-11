@@ -1,0 +1,90 @@
+diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
+index 3758402..3ce4b87 100644
+--- a/runtime/src/vawin.c
++++ b/runtime/src/vawin.c
+@@ -45,7 +45,10 @@ static uint64_t g_res;       // 起局时预留的大小（收尾部前的 g_siz
+ //   MAP_SHARED 映射，偏移 = 地址 − 窗口基址，保护仍是 PROT_NONE，之后的 mprotect / vm_remap 别名 / 零拷贝 MTLBuffer 照旧（Mac 实测 GPU 读写、两处映射一致）。
+ //   还页（缩堆、解除物理映射、解别名）改成「打洞 + 原偏移重新映射成 PROT_NONE」：打洞把那段文件块还回去，再读是 0，同匿名占位的语义（s2a_guest_zero）。
+ //   写保护缺页在文件映射上同样是 SIGBUS（同匿名，Mac 实测）。代价：内存紧张时内核把脏页写回闪存（写量 / 帧时待真机量）
+-static int g_gfd = -1;
++static int g_gfd = -1;   /* the first chunk's fd: only 'is it on' is asked of it */
++// S2Arm (fork): the guest window is backed by chunk files of S2A_GUEST_FILE_CHUNK_MB (1024) each instead of one file the size of the window (about 30 GB for Mario Kart World). nxnative measured
++//   the system's periodic flush of dirty file pages at 148 ms with one 20 GB file and 4 ms with twenty 1 GB files (docs/reference/memory.md); the iPad froze for seconds at a time
++enum { GCH_MAX = 256 }; static int g_gfds[GCH_MAX]; static uint64_t g_gch; static int g_gn; static int g_xfd = -1;   /* g_xfd: the file of s2a_guest_map_any */
+ int s2a_guest_fd(void) { return g_gfd; }
+ // 开不开（纯函数，t_guest_file_auto 测）：e = S2A_GUEST_FILE；pool = 本款应用内存池；room = 起局时离系统给本进程的内存上限还剩多少（os_proc_available_memory，
+ //   0 = 不知道上限，Mac 恒传 0）；host = 宿主自身开销估计；margin = 余量。设了按设的（"0" 关、其余开）；没设 → 上限已知且「池 + 宿主开销 + 余量」装不下才开。
+@@ -113,7 +116,8 @@ uint64_t s2a_guest_mem_seen(void) {
+ // 心跳调（每 10 秒，后台串行队列）：footprint = 进程实占字节；开着文件后备时加上文件里已落块的客体字节（脏页不计实占，换成匿名就都算）。比记录大才写（tmp + rename）
+ void s2a_guest_mem_note(uint64_t footprint) {
+     uint64_t total = footprint; struct stat st;
+-    if (g_gfd >= 0 && !fstat(g_gfd, &st)) total += (uint64_t)st.st_blocks * 512ull;
++    for (int i = 0; i < g_gn; i++) if (!fstat(g_gfds[i], &st)) total += (uint64_t)st.st_blocks * 512ull;
++    if (g_xfd >= 0 && !fstat(g_xfd, &st)) total += (uint64_t)st.st_blocks * 512ull;
+     static uint64_t rec; static int loaded; if (!loaded) { rec = s2a_guest_mem_seen(); if (rec == UINT64_MAX) rec = 0; loaded = 1; }   // 坏记录：本局的实测覆盖它
+     if (total <= rec) return;
+     char p[1024], t[1100]; if (!mem_peak_path(p, sizeof p)) return;
+@@ -170,32 +174,47 @@ static void guest_file_attach_(void) {
+       if (statfs(td && *td ? td : "/tmp", &sf)) { LOG("【黄】客体内存文件后备：查不了临时目录剩余空间（errno=%d），照旧用匿名内存", errno); return; }
+       uint64_t avail = (uint64_t)sf.f_bavail * (uint64_t)sf.f_bsize;
+       if (avail < need) { LOG("【黄】客体内存文件后备：临时目录剩余 %llu MB < 需要 %llu MB（S2A_GUEST_FILE_MIN_FREE_MB），照旧用匿名内存", (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20)); return; } }
+-    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+-    if (fd < 0) { LOG("【红】客体内存文件后备：建不了临时文件（errno=%d），照旧用匿名内存", errno); return; }
+-    unlink(path);
+-    if (ftruncate(fd, (off_t)g_size)) { LOG("【红】客体内存文件后备：文件定长 %llu MB 失败（errno=%d），照旧用匿名内存", (unsigned long long)(g_size >> 20), errno); close(fd); return; }
+-    void *p = mmap((void *)g_base, g_size, PROT_NONE, MAP_FIXED | MAP_SHARED, fd, 0);
+-    if (p != (void *)g_base) {   // 失败时那段可能已被拆掉：盖回匿名占位
+-        int er = errno; mmap((void *)g_base, g_size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); close(fd);
+-        LOG("【红】客体内存文件后备：窗口 %#llx +%llu MB 映射成文件失败（errno=%d），照旧用匿名内存", (unsigned long long)g_base, (unsigned long long)(g_size >> 20), er); return; }
+-    g_gfd = fd;
+-    LOG("客体内存文件后备：窗口 %#llx +%llu MB 映射到临时文件（已 unlink，稀疏），脏页不计进程实占（S2A_GUEST_FILE）", (unsigned long long)g_base, (unsigned long long)(g_size >> 20));
++    uint64_t ch = env_mb("S2A_GUEST_FILE_CHUNK_MB", 1024); if (ch < (64ull << 20)) ch = 64ull << 20; ch &= ~0x3FFFull;
++    uint64_t nch = (g_size + ch - 1) / ch; if (nch > GCH_MAX) { ch = (g_size / GCH_MAX + 0x3FFF) & ~0x3FFFull; nch = (g_size + ch - 1) / ch; }
++    int fds[GCH_MAX]; uint64_t made = 0; int bad = 0, er = 0;
++    for (uint64_t i = 0; i < nch && !bad; i++) {
++        char cp[1100]; snprintf(cp, sizeof cp, "%s/s2a_guest_%d_%llu.bin", td && *td ? td : "/tmp", (int)getpid(), (unsigned long long)i);
++        uint64_t off = i * ch, len = g_size - off < ch ? g_size - off : ch;
++        int fd = open(cp, O_RDWR | O_CREAT | O_EXCL, 0600); if (fd < 0) { er = errno; bad = 1; break; }
++        unlink(cp);
++        if (ftruncate(fd, (off_t)len)) { er = errno; close(fd); bad = 2; break; }
++        void *p = mmap((void *)(uintptr_t)(g_base + off), len, PROT_NONE, MAP_FIXED | MAP_SHARED, fd, 0);
++        if (p != (void *)(uintptr_t)(g_base + off)) { er = errno; close(fd); bad = 3; break; }
++        fds[made++] = fd;
++    }
++    if (bad) {   // a failure may have taken part of the window apart: cover all of it with the anonymous placeholder again
++        mmap((void *)g_base, g_size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); for (uint64_t i = 0; i < made; i++) close(fds[i]);
++        LOG("【红】客体内存文件后备：块文件 %llu / %llu 失败（步骤 %d，errno=%d），照旧用匿名内存", (unsigned long long)made, (unsigned long long)nch, bad, er); return; }
++    for (uint64_t i = 0; i < made; i++) g_gfds[i] = fds[i];
++    g_gn = (int)made; g_gch = ch; g_gfd = g_gfds[0];
++    LOG("客体内存文件后备：窗口 %#llx +%llu MB 映射到 %llu 个临时文件，每个 %llu MB（已 unlink，稀疏），脏页不计进程实占（S2A_GUEST_FILE；S2A_GUEST_FILE_CHUNK_MB）", (unsigned long long)g_base, (unsigned long long)(g_size >> 20), (unsigned long long)made, (unsigned long long)(ch >> 20));
+ }
+ // 窗口外也要文件后备的一段（远端影子区堆区余量用完、改从宿主任意空闲地址分时，far.c）：文件往后接长，按新偏移映射到内核挑的地址（同匿名的落点规则，不多占窗口外地址）。
+ //   没开文件后备返回 MAP_FAILED（调用方照旧匿名）。这些段还页时不打洞（s2a_guest_zero 只认窗口），换匿名占位：语义同样是零，只是那几页回到匿名记账
+ static pthread_mutex_t g_gextra_mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_gextra;
+ void *s2a_guest_map_any(uint64_t len) {
+     if (g_gfd < 0 || !len) return MAP_FAILED;
+-    pthread_mutex_lock(&g_gextra_mu); uint64_t off = g_size + g_gextra; int ok = !ftruncate(g_gfd, (off_t)(off + len)); if (ok) g_gextra += len; pthread_mutex_unlock(&g_gextra_mu);
++    pthread_mutex_lock(&g_gextra_mu);
++    if (g_xfd < 0) { const char *td = getenv("TMPDIR"); char xp[1100]; snprintf(xp, sizeof xp, "%s/s2a_guest_%d_x.bin", td && *td ? td : "/tmp", (int)getpid()); g_xfd = open(xp, O_RDWR | O_CREAT | O_EXCL, 0600); if (g_xfd >= 0) unlink(xp); }
++    uint64_t off = g_gextra; int ok = g_xfd >= 0 && !ftruncate(g_xfd, (off_t)(off + len)); if (ok) g_gextra += len; pthread_mutex_unlock(&g_gextra_mu);
+     if (!ok) return MAP_FAILED;
+-    return mmap(NULL, len, PROT_NONE, MAP_SHARED, g_gfd, (off_t)off);
++    return mmap(NULL, len, PROT_NONE, MAP_SHARED, g_xfd, (off_t)off);
+ }
+-// [a, a + n) 在文件后备的窗口里：打洞（还文件块，再读是 0）并按原偏移重新映射成不可访问，返回 1；不在 / 没开文件后备返回 0（调用方照旧换匿名占位）
++// [a, a + n) in the file-backed window: punch the hole (the file blocks go back, reads give 0) and map it again where it was as inaccessible, chunk by chunk; 1 = done, 0 = not in the window / not on (the caller swaps in an anonymous placeholder)
+ int s2a_guest_zero(uint64_t a, uint64_t n) {
+     if (g_gfd < 0 || a < g_base || a + n > g_base + g_size || !n) return 0;
+-    fpunchhole_t ph; memset(&ph, 0, sizeof ph); ph.fp_offset = (off_t)(a - g_base); ph.fp_length = (off_t)n;
+-    if (fcntl(g_gfd, F_PUNCHHOLE, &ph)) { static int once; if (!once++) LOG("【红】客体内存文件后备：打洞失败（errno=%d，%#llx +%#llx），这段改回匿名占位", errno, (unsigned long long)a, (unsigned long long)n); return 0; }
+-    if (mmap((void *)(uintptr_t)a, n, PROT_NONE, MAP_FIXED | MAP_SHARED, g_gfd, (off_t)(a - g_base)) != (void *)(uintptr_t)a) return 0;
++    for (uint64_t p = a, left = n; left;) {
++        uint64_t rel = p - g_base, idx = rel / g_gch, co = rel % g_gch, take = g_gch - co < left ? g_gch - co : left; int fd = g_gfds[idx];
++        fpunchhole_t ph; memset(&ph, 0, sizeof ph); ph.fp_offset = (off_t)co; ph.fp_length = (off_t)take;
++        if (fcntl(fd, F_PUNCHHOLE, &ph)) { static int once; if (!once++) LOG("【红】客体内存文件后备：打洞失败（errno=%d，%#llx +%#llx），这段改回匿名占位", errno, (unsigned long long)p, (unsigned long long)take); return 0; }
++        if (mmap((void *)(uintptr_t)p, take, PROT_NONE, MAP_FIXED | MAP_SHARED, fd, (off_t)co) != (void *)(uintptr_t)p) return 0;
++        p += take; left -= take;
++    }
+     return 1;
+ }
+ // [a, a + n) 全在文件后备的窗口里返回 1（没开 / 不在 / n 为 0 返回 0）。svc_mem.c 的懒清零（#258）按它判走不走

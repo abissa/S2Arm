@@ -1,5 +1,5 @@
 diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
-index b6cdc1f..38f2fe9 100644
+index b6cdc1f..a3ab18a 100644
 --- a/graphics/nvn/gfx/nvn/nvn_mtl.m
 +++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
 @@ -3286,7 +3286,7 @@ static pthread_mutex_t g_vs_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -44,7 +44,7 @@ index b6cdc1f..38f2fe9 100644
      uint64_t cnt[4][3] = {{0}}, byt[4][3] = {{0}};   // class (0 packaged, 1 sparse mapped tiles, 2 render targets, 3 other GPU textures) x (all, idle > 300, idle > 1200 or never used)
      uint64_t never_b = 0, never_n = 0;
      struct { uint64_t b, ser, idle; unsigned w, h, fmt; int cls; } top[6]; memset(top, 0, sizeof top);
-@@ -14248,6 +14250,53 @@ static void img_wr_prescan(NvShader *sh, int nvn_stage) {
+@@ -14248,6 +14250,52 @@ static void img_wr_prescan(NvShader *sh, int nvn_stage) {
      pthread_mutex_unlock(&g_rmu);
  }
  static void tensor_standin(NvShader *cs);   // nvn_tensor.inc
@@ -66,10 +66,9 @@ index b6cdc1f..38f2fe9 100644
 +    static uint64_t last; if (fr < 600 || fr / 1200 == last) return; last = fr / 1200;
 +    if (g_m3 || !g_q4 || !g_dev) return;
 +    uint64_t sers[8]; int ns = 0, cands = 0;
-+    pthread_mutex_lock(&g_rmu);
-+    for (int tid = 1; tid < g_ntreg && ns < 8; tid++) { treg_t *r = &g_treg[tid]; if (!r->ok || r->gone || r->t.d.width != 128 || r->t.d.height != 128 || tex_layers(&r->t) != 5) continue;
++    // no lock: the caller (a texture lookup) holds g_rmu already, and taking it again hung the game at frame 1200 (v61)
++    for (int tid = 1, nt_ = g_ntreg; tid < nt_ && ns < 8; tid++) { treg_t *r = &g_treg[tid]; if (!r->ok || r->gone || r->t.d.width != 128 || r->t.d.height != 128 || tex_layers(&r->t) != 5) continue;
 +        cands++; int dup = 0; for (int i = 0; i < ns; i++) dup |= sers[i] == r->t.serial; if (!dup) sers[ns++] = r->t.serial; }
-+    pthread_mutex_unlock(&g_rmu);
 +    if (@available(macOS 26.0, iOS 26.0, *)) { @autoreleasepool {
 +        int done = 0;
 +        for (int i = 0; i < ns; i++) {
@@ -98,7 +97,7 @@ index b6cdc1f..38f2fe9 100644
  static void dispatch(const p_dispatch *dp) {
      geo_run_flush();
      zskip_clear();
-@@ -14298,6 +14347,7 @@ static void dispatch(const p_dispatch *dp) {
+@@ -14298,6 +14346,7 @@ static void dispatch(const p_dispatch *dp) {
      // A store the shader makes on its very first invocation only, before the others run on the Switch: the build takes it out of the shader (S.Dsh first_store; upstream reference
      //   implementation, MIT, c8521eeb / e07cba1c), as Apple's GPUs start workgroups in no order. The host makes it here, in order before this dispatch; an empty dispatch makes none.
      //   A slot not bound, a word past the binding's size, or an address in no pool is skipped

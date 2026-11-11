@@ -1,0 +1,21 @@
+diff --git a/runtime/src/vawin.c b/runtime/src/vawin.c
+index f8aac72..f0adfbf 100644
+--- a/runtime/src/vawin.c
++++ b/runtime/src/vawin.c
+@@ -184,6 +184,7 @@ static void guest_file_attach_(void) {
+     uint64_t host = env_mb("S2A_GUEST_FILE_HOST_MB", 2048), margin = env_mb("S2A_GUEST_FILE_MARGIN_MB", 512), seen = s2a_guest_mem_seen();
+     int died = room && s2a_guest_run_died();
+     int on = s2a_guest_file_wanted4(e, pool, room, seen, host, margin, died);
++    if (!on && !(e && *e) && pool >= (8ull << 30)) { on = 1; LOG("客体内存文件后备：S2Arm 分支：池 %llu MB（≥ 8 GB）在 iPhone / iPad 上一律开", (unsigned long long)(pool >> 20)); }   /* S2Arm (fork): a 9 GB guest pool in RAM reaches the per-app limit (iPad 12.3 GB) */
+     const char *why = e && *e ? "按 S2A_GUEST_FILE 显式设定" : !room ? "自动：不知道单进程上限（Mac 会换页），缺省关"
+                     : pool > room ? "自动：池本身大于剩余，装不下"
+                     : died ? "自动：上一局在前台时死掉（「在跑」标记还在：被内存上限杀 / 崩溃 / 测试局在前台被 devicectl 结束），这一局强制开、记下真实峰值"
+@@ -218,7 +219,7 @@ static void guest_file_map(void) {
+     const char *td = getenv("TMPDIR"); char path[1024]; snprintf(path, sizeof path, "%s/s2a_guest_%d.bin", td && *td ? td : "/tmp", (int)getpid());
+     // 起局前查闪存剩余空间（11-05 能耗线）：文件稀疏，只占内核写回的块，最坏涨到游戏弄脏的客体内存总量（Switch 2 是 12 GB）。
+     //   不够就不接文件、照旧用匿名内存（等于开关关），打一行黄；门槛 S2A_GUEST_FILE_MIN_FREE_MB（缺省 12288）
+-    { const char *m = getenv("S2A_GUEST_FILE_MIN_FREE_MB"); uint64_t need = (m && *m ? strtoull(m, NULL, 10) : 12288ull) << 20; struct statfs sf;
++    { const char *m = getenv("S2A_GUEST_FILE_MIN_FREE_MB"); uint64_t need = (m && *m ? strtoull(m, NULL, 10) : 3072ull) << 20; struct statfs sf;
+       if (statfs(td && *td ? td : "/tmp", &sf)) { LOG("【黄】客体内存文件后备：查不了临时目录剩余空间（errno=%d），照旧用匿名内存", errno); return; }
+       uint64_t avail = (uint64_t)sf.f_bavail * (uint64_t)sf.f_bsize;
+       if (avail < need) {   // 先不接、记下「要接没接上」，开局装模块前再试一次（s2a_guest_file_retry）

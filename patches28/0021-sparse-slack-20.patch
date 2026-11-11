@@ -1,0 +1,13 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index b0e76c6..2393bb4 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3273,7 +3273,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+         }
+     }
+     // S2Arm (fork): room to grow in place (0018): Mario Kart World's virtual texture arrays keep getting pages while the game runs (93 -> 681 MB in a minute); a full heap means a rebuild + full re-upload (0.2 - 0.9 s)
+-    uint64_t slack_pct = 50; { const char *e = getenv("S2A_SPARSE_SLACK"); if (e && *e) slack_pct = strtoull(e, NULL, 10); }
++    uint64_t slack_pct = 20; {   /* 20: a heap's size counts toward the ~18 GB device allocation Metal allows (Mario Kart World's buffers failed to create at 18.1 - 18.3 GB with 4.3 GB of heaps at 50 %) */ const char *e = getenv("S2A_SPARSE_SLACK"); if (e && *e) slack_pct = strtoull(e, NULL, 10); }
+     uint64_t bytes = (need + need * slack_pct / 100 + (gpu ? 64 : 2048)) * tileBytes; bytes = (bytes + 0xFFFFF) & ~0xFFFFFull;   // slack, whole MB
+     uint64_t al0 = g_dev.currentAllocatedSize;
+     id<MTLHeap> hp = sp_heap((NSUInteger)bytes); uint64_t al1 = g_dev.currentAllocatedSize;

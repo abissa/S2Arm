@@ -1,0 +1,17 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 7135a9d..d91cd99 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -4777,6 +4777,12 @@ int nvn_sparse_any_mapped(const void *pool, uint64_t a, uint64_t n) {
+     if (v) for (uint64_t o = (a - (uint64_t)(uintptr_t)v->base) & ~0xFFFull, end = a - (uint64_t)(uintptr_t)v->base + n; !any && o < end; o += 0x1000) { const vpte *e = o < v->size ? vpt_get(v, o) : NULL; any = e && e->phys; }
+     vp_unlock(); return any;
+ }
++// S2Arm (fork): how many bytes of [a, a+n) have memory behind them (4 KB pages), for the sparse-density diagnostic
++uint64_t nvn_sparse_count_mapped(const void *pool, uint64_t a, uint64_t n) {
++    vp_lock(); struct vpool *v = vpool_at(pool, a); uint64_t c = 0;
++    if (v) for (uint64_t o = (a - (uint64_t)(uintptr_t)v->base) & ~0xFFFull, end = a - (uint64_t)(uintptr_t)v->base + n; o < end; o += 0x1000) { const vpte *e = o < v->size ? vpt_get(v, o) : NULL; if (e && e->phys) c += 0x1000; }
++    vp_unlock(); return c;
++}
+ void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
+ NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
+     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, GA(ib), GA(ind)});

@@ -1,0 +1,37 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index bbc863d..4ae0e09 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3221,6 +3221,7 @@ static int guest_mem_readable(const void *p, size_t n) {
+ //   (runtime/src/vawin.c, a contiguous reservation below the window) lends the address range; the pages are committed with mprotect and given back with the range
+ void *s2a_vp_arena_map(uint64_t len) __attribute__((weak)); int s2a_vp_arena_has(const void *p, uint64_t n) __attribute__((weak)); void s2a_vp_arena_free(const void *p, uint64_t len) __attribute__((weak));
+ int nvn_sparse_any_mapped(const void *pool, uint64_t a, uint64_t n);   // hle_nvn.c
++uint64_t nvn_sparse_count_mapped(const void *pool, uint64_t a, uint64_t n);   // hle_nvn.c
+ static void *big_alloc(size_t n) {
+     void *p = malloc(n); if (p) return p;
+     if (!s2a_vp_arena_map) return NULL;
+@@ -3259,14 +3260,14 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+       tailFirst = q.firstMipmapInTail; tailTiles = (q.tailSizeInBytes + tileBytes - 1) / tileBytes; }
+     // tiles: for a packaged texture those of the level-layers that hold mapped pages now; for a GPU texture (gpu) all of them (pages are mapped as the game maps them, see sparse_sync)
+     uint32_t nl = t->d.levels ? t->d.levels : 1; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; unsigned layers = tex_layers(t);
+-    uint64_t need = 0, mappedNow = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
++    uint64_t need = 0, mappedNow = 0, pgb = 0; NSMutableIndexSet *tl = [NSMutableIndexSet indexSet];
+     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
+         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u);
+         for (unsigned y = 0; y < layers; y++) {
+             uint64_t lo = (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l), hi = l + 1 < nl ? (uint64_t)y * ls + nvn_tex_level_offset(&t->d, l + 1) : (uint64_t)(y + 1) * ls;
+             if (hi <= lo || hi > t->L.size) continue;
+             int any = nvn_sparse_any_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo);
+-            if (any) mappedNow += hi - lo;
++            if (any) { mappedNow += hi - lo; pgb += nvn_sparse_count_mapped(t->pool, (uint64_t)(uintptr_t)t->mem + lo, hi - lo); }
+             if (!gpu && !any) continue;
+             if (l >= tailFirst) { if (![tl containsIndex:y]) { [tl addIndex:y]; need += tailTiles; } }
+             else need += (uint64_t)((w + ts.width - 1) / ts.width) * ((h + ts.height - 1) / ts.height);
+@@ -3288,6 +3289,7 @@ static id<MTLTexture> sparse_create(const tex_t *t, MTLTextureDescriptor *d, int
+     { static int said_s; if (said_s++ < 60) MLOG("[sparse] %s texture ser=%llu %lux%lux%lu levels %lu (full size %llu MB, %llu MB of it with mapped pages now) is a Metal sparse texture: tile %lux%lu, %llu bytes, mip tail from level %lu (%lu tiles); %llu tiles needed (%llu MB), heap %llu MB; device allocation +%lld MB after the heap, +%lld MB after the texture; %llu sparse textures alive (%llu MB of heaps), %llu created in all",
+         gpu ? "GPU" : "packaged", (unsigned long long)t->serial, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long long)(sa.size >> 20), (unsigned long long)(mappedNow >> 20), (unsigned long)ts.width, (unsigned long)ts.height, (unsigned long long)tileBytes,
+         (unsigned long)tailFirst, (unsigned long)tailTiles, (unsigned long long)need, (unsigned long long)((need * tileBytes) >> 20), (unsigned long long)(bytes >> 20), (long long)((int64_t)(al1 - al0) >> 20), (long long)((int64_t)(al2 - al1) >> 20), (unsigned long long)atomic_load(&g_sp_live_n), (unsigned long long)(atomic_load(&g_sp_live_bytes) >> 20), (unsigned long long)atomic_load(&g_sp_created)); }
++    { static int said_d; if (said_d++ < 80) MLOG("[sparse-density] ser=%llu: level-layers holding mapped pages %llu MB, of which the game really maps %llu MB of pages (%llu %%)", (unsigned long long)t->serial, (unsigned long long)(mappedNow >> 20), (unsigned long long)(pgb >> 20), (unsigned long long)(mappedNow ? pgb * 100 / mappedNow : 0)); }
+     if (gpu) sparse_map_pending(spi, mt);
+     return mt;
+ }

@@ -1,0 +1,73 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn2.c b/graphics/nvn/gfx/nvn/nvn2.c
+index f8e950a..50ea90f 100644
+--- a/graphics/nvn/gfx/nvn/nvn2.c
++++ b/graphics/nvn/gfx/nvn/nvn2.c
+@@ -340,10 +340,14 @@ static uint64_t cam_destroy_alias(uint16_t handle) {
+     if (!atomic_exchange(&said, 1)) LOG("nn::camera::sdk::DestroyAliasOutputBufferPool：宿主没有摄像头，空操作");
+     return 0;
+ }
++extern uint32_t s2a_handle_new(uint32_t kind, uint64_t cookie) __attribute__((weak));
+ static uint64_t cam_create_ctx(void **out_handle) {
+     static _Atomic int said;
+-    if (!atomic_exchange(&said, 1)) LOG("nn::camera::sdk::CreateCameraContext：宿主没有摄像头，输出参数写 NULL");
+-    if (out_handle) *out_handle = NULL;
++    // 马里奥赛车 World：游戏拿这个句柄直接发 IPC（SendSyncRequest）。回 NULL → 句柄 0 → 内核无效句柄 → 游戏中止。
++    //   回一个 C# 种类的会话句柄（cookie 固定 0xCA3E5A00，C# Dispatcher 认得，由「摄像头占位会话」应答：成功 + 零数据）
++    uint32_t h = s2a_handle_new ? s2a_handle_new(4 /* S2A_OBJ_SESSION */, 0xCA3E5A00ull) : 0;
++    if (!atomic_exchange(&said, 1)) LOG("nn::camera::sdk::CreateCameraContext：宿主没有摄像头，输出参数写占位会话句柄 %u", h);
++    if (out_handle) *out_handle = (void *)(uintptr_t)h;
+     return 0;
+ }
+ static uint64_t cam_destroy_ctx(void) {
+diff --git a/services/S2A.Services/Dispatcher.cs b/services/S2A.Services/Dispatcher.cs
+index 9d7fa4a..0b20467 100644
+--- a/services/S2A.Services/Dispatcher.cs
++++ b/services/S2A.Services/Dispatcher.cs
+@@ -16,6 +16,38 @@ using System.Text;
+ 
+ namespace S2A.Services
+ {
++    // 摄像头占位会话：宿主没有摄像头。游戏（马里奥赛车 World）对 CreateCameraContext 给的句柄发 IPC；对任何命令回「成功 + 全零数据」
++    sealed unsafe class CameraStubTarget : SessionTarget
++    {
++        public const ulong Cookie = 0xCA3E5A00;
++        public static readonly CameraStubTarget Instance = new();
++        private int _said;
++        public override string Name => "CameraStub";
++
++        public override uint Process(Dispatcher d, byte* msg, int size)
++        {
++            uint type = *(uint*)msg & 0xFFFF;
++            long cmd = -1;
++            for (int i = 0; i + 12 <= Math.Min(size, 0x100); i += 4)
++            {
++                if (*(uint*)(msg + i) == 0x49434653) { cmd = *(uint*)(msg + i + 8); break; }   // "SFCI"
++            }
++            if (System.Threading.Interlocked.Increment(ref _said) <= 40)
++            {
++                Console.Error.WriteLine($"[camera-stub] type={type} cmd={cmd}（宿主没有摄像头：回成功 + 零数据）");
++            }
++            if (type == 2) { return 0; }   // 关会话
++            bool control = type == 5 || type == 7;
++            uint* w = (uint*)msg;
++            for (int i = 0; i < 16; i++) { w[i] = 0; }
++            w[1] = 10;                       // 原始数据 10 字（含对齐 2 字）
++            w[4] = 0x4F434653;               // "SFCO"
++            w[6] = 0;                        // 结果 = 成功
++            if (control) { w[8] = (uint)Dispatcher.PointerBufferSize; }
++            return 0;
++        }
++    }
++
+     // 一个游戏会话背后的服务端。HLE 服务、sm、Horizon 服务各一种实现。
+     abstract class SessionTarget
+     {
+@@ -577,7 +609,7 @@ namespace S2A.Services
+                 *(ulong*)(msg + 12) = GameProcess.Pid;
+             }
+ 
+-            SessionTarget t = GetSession(cookie);
++            SessionTarget t = cookie == CameraStubTarget.Cookie ? CameraStubTarget.Instance : GetSession(cookie);
+ 
+             if (t == null)
+             {

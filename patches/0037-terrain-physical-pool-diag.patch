@@ -1,0 +1,44 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index d91cd99..6d1bc8a 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -680,6 +680,10 @@ static void ft_flush(const uint8_t *a, uint64_t n) {
+     pthread_mutex_unlock(&g_ft_mu);
+ }
+ int nvn_be_tex_from_gl(tex_t *t, uint32_t gl_name);   // nvn_mtl.m：按 GL 纹理名接存储与描述（声明不放 nvn_obj.h：那是直连出库阶段键的输入，宿主改动不该让各款直连库重出）
++// S2Arm (fork) diagnostic: the physical pools mapped into a virtual pool the CPU cannot access (Mario Kart World's terrain arrays), and what the game creates in them
++static const void *g_tp[4096]; static int g_tpn;
++static int tp_has(const void *p) { int n = g_tpn; for (int i = 0; i < n; i++) if (g_tp[i] == p) return 1; return 0; }
++static void tp_add(const void *p) { if (!tp_has(p) && g_tpn < 4096) g_tp[g_tpn++] = p; }
+ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
+     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
+     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
+@@ -691,6 +695,8 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
+     nvn_tex_layout(&o->d, &o->L);
+     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
+     o->serial = nvn_new_serial(); nvn_be_tex_init(o);
++    if (s->pool && tp_has(s->pool)) { static int n_; if (n_++ < 60) LOG("[tp] texture ser=%llu %ux%ux%u format %#x target %d flags %#x levels %u in a terrain physical pool %p (flags %#x, %#llx bytes) at offset %#llx, storage %#llx bytes",
++        (unsigned long long)o->serial, o->d.width, o->d.height, o->d.depth, (unsigned)o->d.format, (int)o->d.target, (unsigned)o->d.flags, (unsigned)o->d.levels, (const void *)s->pool, s->pool->flags, (unsigned long long)s->pool->size, (unsigned long long)s->off, (unsigned long long)o->L.size); }
+     if (s->gl_name && nvn_be_tex_from_gl(o, s->gl_name)) nvn_tex_layout(&o->d, &o->L);   // 按 GL 纹理建：描述换成 GL 的，存储是 GL 那张（nvn_mtl.m）
+     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ.
+         //   DM_NVN_TEXINFO=any (or 0x0) drops the size filter: every texture is logged and the line says all=1 (still capped at the first 200)
+@@ -3687,6 +3693,7 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b)
+     // 缓冲对象只是「池 + 偏移 + 大小」的视图，建时不分配、真机驱动也不在这里查：越过池尾本身不是错，读写越过池尾才是（10-26 塞尔达按 + 开系统菜单：
+     //   0x24000 的池上建 0x40000 的缓冲，菜单画面完整、局到 MARK；原先报红让能玩格判红）。黄字提示，访问时的越界检查另做
+     if ((uint64_t)bb->off + bb->size > bb->pool->size) LOG("【黄】 BufferInitialize: buffer object extends past the end of its pool (offset %#llx size %#llx pool %#llx); only an access past the end would be wrong", (unsigned long long)bb->off, (unsigned long long)bb->size, (unsigned long long)bb->pool->size);
++    if (tp_has(bb->pool)) { static int n_; if (n_++ < 40) LOG("[tp] buffer of %#llx bytes at offset %#llx in a terrain physical pool %p (flags %#x, %#llx bytes)", (unsigned long long)bb->size, (unsigned long long)bb->off, (const void *)bb->pool, bb->pool->flags, (unsigned long long)bb->pool->size); }
+     *(buf_t *)buf = (buf_t){MAGIC('B', 'U', 'F', 0), bb->pool, bb->off, bb->size};
+     if (bb->pool->mem) buf_reg_put((uint64_t)(uintptr_t)(bb->pool->mem) + (uint64_t)bb->off, bb->size);
+     pool_mark_addressed(bb->pool);   // 缓冲一建好，它的地址就可能被游戏算出来（池地址 + 偏移）
+@@ -3996,6 +4003,11 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
+     if (((uint64_t)r->voff | r->size | (uint64_t)r->poff) & 0xFFF) { LOG("【红】 virtual pool %p: request %#llx+%#llx (physical offset %#llx) is not 4 KB aligned", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)r->poff); return 0; }
+     if (r->size == 0) return 1;   // 0 字节请求无事可做（原先落到 vm_remap(0 字节) 回 KERN_INVALID_ARGUMENT → MapVirtual 失败）
+     const pool_t *ph = (const pool_t *)r->phys;
++    if (ph && v->pool && (v->pool->flags & 0x1)) { int new_ = !tp_has(ph); tp_add(ph); static int n_; static uint64_t maps_, nzmaps_; maps_++;
++        uint64_t nz = 0, tot = 0; if (ph->mem && r->poff >= 0 && (uint64_t)r->poff + r->size <= ph->size) { const uint64_t *w = (const uint64_t *)(ph->mem + r->poff); tot = r->size / 8; for (uint64_t i = 0; i < tot; i += 8) nz += w[i] != 0; }
++        if (nz) nzmaps_++;
++        if (new_ ? n_++ < 60 : (nz && n_++ < 120) || maps_ % 2000 == 0) LOG("[tp] map into virtual pool %p (flags %#x) at %#llx+%#llx from physical pool %p (flags %#x, %#llx bytes, storage %p) offset %#llx%s: sampled words non-zero %llu of %llu; %llu maps so far, %llu with data, %d physical pools",
++            (const void *)v->pool, v->pool->flags, (unsigned long long)r->voff, (unsigned long long)r->size, (const void *)ph, ph->flags, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, new_ ? " (new pool)" : "", (unsigned long long)nz, (unsigned long long)(tot / 8), (unsigned long long)maps_, (unsigned long long)nzmaps_, g_tpn); }
+     if (ph && (!ph->mem || r->poff < 0 || (uint64_t)r->poff + r->size > ph->size)) { LOG("【红】 virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }
+     vpt_set(v, (uint64_t)r->voff, r->size, ph ? ph->mem + r->poff : NULL);
+     vm_address_t to = (vm_address_t)(v->base + r->voff);

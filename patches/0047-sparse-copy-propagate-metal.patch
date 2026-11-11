@@ -1,0 +1,50 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index bf4cf4f..59aa205 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3291,6 +3291,37 @@ static void sp_share_run(void) {
+     if (began) up_flush();
+     { static uint64_t said; if (said++ < 30 || said % 300 == 0) MLOG("[vt-share] %u requests: %llu copies in all (%llu of the small levels), %llu not placed, %llu already the same place", n, (unsigned long long)done, (unsigned long long)tails, (unsigned long long)miss, (unsigned long long)same); }
+ }
++// S2Arm (fork): a GPU copy into a sparse texture is repeated at the other places that map the same physical memory, right behind it in the same encoder. Mario Kart World maps its terrain
++//   arrays' pages at both places first and copies the data in afterwards (frame 116), so telling a new place at map time (sp_share_run) comes too early for those
++int nvn_sparse_places(const void *pool, const uint8_t *va, const uint8_t **out, int max);   // hle_nvn.c
++static id<MTLTexture> tex_mtl(const tex_t *ct);
++static void sp_propagate(const p_copy_t2t *c) {
++    if (!c->dst || !c->dst->pool || !(c->dst->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || !g_sp_all) return;
++    id<MTLTexture> mt = tex_mtl(c->dst); while (mt.parentTexture) mt = mt.parentTexture;
++    SpInfo *s = sp_info(mt); if (!s || !s->lsz) return;
++    unsigned level = c->has_dv && c->dv.set_levels ? (unsigned)c->dv.base_level : 0, layer0 = (c->has_dv && c->dv.set_layers ? (unsigned)c->dv.min_layer : 0) + (unsigned)c->dr.zoffset, nlay = c->dr.depth > 0 ? (unsigned)c->dr.depth : 1;
++    uint32_t nl = s->td.levels ? s->td.levels : 1; if (level >= nl || level >= s->nlev) return;
++    int bw, bh, bpb = nvn_fmt_bpb(s->td.format, &bw, &bh);
++    uint32_t tbw = bpb == 16 ? 64 : bpb == 8 || bpb == 4 ? 128 : 0, tbh = bpb == 16 || bpb == 8 ? 64 : bpb == 4 ? 128 : 0; if (!tbw) return;
++    uint32_t w = MAX(s->td.width >> level, 1u), h = MAX(s->td.height >> level, 1u), wb = (w + (uint32_t)bw - 1) / (uint32_t)bw, hb = (h + (uint32_t)bh - 1) / (uint32_t)bh;
++    uint64_t lo = nvn_tex_level_offset(&s->td, level); int tail = wb < tbw || hb < tbh;
++    uint32_t tw = tbw * (uint32_t)bw, th = tbh * (uint32_t)bh, nx = tail ? 1 : (wb + tbw - 1) / tbw;
++    uint32_t x0 = tail ? 0 : (uint32_t)MAX(c->dr.xoffset, 0) / tw, y0 = tail ? 0 : (uint32_t)MAX(c->dr.yoffset, 0) / th;
++    uint32_t x1 = tail ? 0 : ((uint32_t)MAX(c->dr.xoffset, 0) + (uint32_t)MAX(c->dr.width, 1) - 1) / tw, y1 = tail ? 0 : ((uint32_t)MAX(c->dr.yoffset, 0) + (uint32_t)MAX(c->dr.height, 1) - 1) / th;
++    static uint64_t done, tails, asked; id<MTL4ComputeCommandEncoder> b = nil;
++    for (unsigned y = layer0; y < layer0 + nlay && y < s->layers; y++) for (uint32_t ty = y0; ty <= y1; ty++) for (uint32_t tx = x0; tx <= x1; tx++) {
++        const uint8_t *va = s->base + (uint64_t)y * s->lsz + lo + (tail ? 0 : (uint64_t)(ty * nx + tx) * 0x10000), *pl[4]; asked++;
++        int np = nvn_sparse_places(s->pool, va, pl, 4);
++        for (int i = 0; i < np; i++) { sp_place d; if (!sp_locate(pl[i], &d) || d.tex.pixelFormat != mt.pixelFormat || d.tail != tail) continue;
++            uint32_t sx = tx * tw, sy = ty * th; if (!tail && (sx >= w || sy >= h)) continue;
++            uint32_t cw = tail ? w : MIN(tw, w - sx), ch = tail ? h : MIN(th, h - sy);
++            if (tail ? (d.level != level || d.tex.width != mt.width) : (d.w != cw || d.h != ch)) continue;
++            sparse_map_pending(d.spi, d.tex);
++            if (!b) b = blit();
++            enc_b_copy_texture(b, mt, y, level, MTLOriginMake(tail ? 0 : sx, tail ? 0 : sy, 0), MTLSizeMake(cw, ch, 1), d.tex, d.layer, d.level, MTLOriginMake(d.x, d.y, 0)); done++; tails += tail; }
++    }
++    { static uint64_t said; if (said++ < 20 || said % 500 == 0) MLOG("[vt-share] copy into sparse ser=%llu level %u layer %u: %llu tiles asked so far, %llu copies to other places (%llu of small levels)", (unsigned long long)c->dst->serial, level, layer0, (unsigned long long)asked, (unsigned long long)done, (unsigned long long)tails); }
++}
+ // A GPU sparse texture follows the game's page mapping: when pages were mapped since the last look (and a few frames passed), the new ones get tiles
+ static void sparse_sync(SpInfo *spi, id<MTLTexture> mt) {
+     uint64_t g = nvn_sparse_gen(); if (g == spi->gen) return;
+@@ -14060,6 +14091,7 @@ static void copy_t2t(const p_copy_t2t *c) {
+         }
+     }
+     copy_t2t_(c);
++    sp_propagate(c);   // S2Arm (fork)
+ }
+ // Downsample from a multisample texture of another size (11-02 Digimon Story Time Stranger: 1920x1080 4 samples → 1280x720, with or without widening): the game renders its handheld
+ //   1280x720 picture into the corner of a 1920x1080 multisample target and resolves that corner into a 1280x720 texture, so the destination takes the source's corner of its own size

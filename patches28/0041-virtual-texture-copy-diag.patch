@@ -1,0 +1,21 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 7d7c502..f36e383 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -14076,6 +14076,7 @@ int nvn_be_tex_storage_read(const void *nvntex, uint8_t *dst, size_t row) {
+ }
+ void nvn_be_rs_mark_bad(const void *nvntex) { const tex_t *t = nvntex; if (t && t->magic == MAGIC('T', 'E', 'X', 0)) rs_bad(tex_mtl(t), "测试标记"); }
+ static void copy_b2t(const p_copy_b2t *c) {
++    if (c->tex && c->tex->pool && (c->tex->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) { static uint64_t n_; n_++; if (n_ <= 40 || n_ % 1000 == 0) MLOG("[vt-copy] buffer -> texture #%llu frame %llu: ser=%llu %ux%ux%u format %#x pool flags %#x, region %d,%d,%d %dx%dx%d level %u", (unsigned long long)n_, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.depth, (unsigned)c->tex->d.format, c->tex->pool->flags, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->has_view && c->view.set_levels ? (unsigned)c->view.base_level : 0u); }   // S2Arm (fork) diagnostic
+     if (fold_copy_skip(c->tex, "buffer→texture copy")) return;
+     if (c->tex) zskip_del(c->tex->serial);
+     id<MTLTexture> t = tex_mtl(c->tex);
+@@ -14222,6 +14223,8 @@ static uint64_t g_wd_copy_full, g_wd_copy_part;
+ static void copy_t2t_(const p_copy_t2t *c);
+ static void dlss_eval(const p_dlss *d, uint32_t size);   // nvn_dlss.inc
+ static void copy_t2t(const p_copy_t2t *c) {
++    { int sv_ = c->src && c->src->pool && (c->src->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL), dv_ = c->dst && c->dst->pool && (c->dst->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL);
++      if (sv_ || dv_) { static uint64_t n_; n_++; if (n_ <= 40 || n_ % 1000 == 0) MLOG("[vt-copy] texture -> texture #%llu frame %llu: src ser=%llu %ux%u format %#x%s -> dst ser=%llu %ux%u format %#x%s, region %dx%dx%d", (unsigned long long)n_, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->src->serial, c->src->d.width, c->src->d.height, (unsigned)c->src->d.format, sv_ ? " (virtual pool)" : "", (unsigned long long)c->dst->serial, c->dst->d.width, c->dst->d.height, (unsigned)c->dst->d.format, dv_ ? " (virtual pool)" : "", c->dr.width, c->dr.height, c->dr.depth); } }   // S2Arm (fork) diagnostic
+     // GPU 写出的贴图拷到别处，目标也是 GPU 内容，不当 16:9 原比例页的来源（核心按 src 判：CPU 供图拷来拷去仍是图片；10-26 八方2 场景图）
+     if (g_wd > 0 && c->src && c->dst) { pthread_mutex_lock(&g_wd_mu); s2a_widen_gpu_wrote((uint32_t)c->dst->serial, (uint32_t)c->src->serial); pthread_mutex_unlock(&g_wd_mu); }
+     if (rs_on() && c->dst && (c->flags & DM_COPY_RESOLVE) && rs_state(tex_mtl(c->dst)) == RS_SCALED) rs_rescale(tex_mtl(c->dst), 0, "多重采样解析的目标");   // S2Arm internal resolution: a resolve needs equal sizes (multisample storages are never scaled)

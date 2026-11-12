@@ -1,0 +1,18 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index b8a644e..2490a27 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -3470,7 +3470,12 @@ static id<MTLTexture> vs_create(const tex_t *t, MTLTextureDescriptor *d) {
+     if (!vs_on() || !t->pool) return nil;
+     VST("vs_create enter ser=%llu %ux%u format %#x", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+-    uint32_t tbw = bpb == 16 ? 64 : bpb == 8 || bpb == 4 ? 128 : 0, tbh = bpb == 16 || bpb == 8 ? 64 : bpb == 4 ? 128 : 0; if (!tbw) return nil;
++    uint32_t tbw = bpb == 16 ? 64 : bpb == 8 || bpb == 4 ? 128 : 0, tbh = bpb == 16 || bpb == 8 ? 64 : bpb == 4 ? 128 : 0;
++    // S2Arm (fork) S2A_VS_SMALL (default on, 0 = off): formats of 1 and 2 bytes a texel have 64 KB tiles of 256x256 and 256x128 texels (the standard sparse block shapes). Mario Kart World's 512x512x101 depth array (2 bytes,
++    //   the one kartnative names as a pop-in candidate: sampled by the foliage, the grass and about 40 model shaders) was left to the old path with tiles of its own. Metal's tile size for the format is still compared below
++    { static int sm_ = -1; if (sm_ < 0) { const char *e_ = getenv("S2A_VS_SMALL"); sm_ = !(e_ && !strcmp(e_, "0")); MLOG("shared tiles for formats of 1 and 2 bytes a texel: %s (S2A_VS_SMALL)", sm_ ? "yes" : "no"); }
++      if (!tbw && sm_ && (bpb == 2 || bpb == 1)) { tbw = 256; tbh = bpb == 2 ? 128 : 256; } }
++    if (!tbw) return nil;
+     uint32_t ntw = tbw * (uint32_t)bw, nth = tbh * (uint32_t)bh; uint64_t ls = t->L.layer_size ? t->L.layer_size : t->L.size; if (!ls || (ls & 0xFFFF)) return nil;
+     id<MTLTexture> mt = nil; SpInfo *spi = nil;
+     if (@available(macOS 26.0, iOS 26.0, *)) { @autoreleasepool {

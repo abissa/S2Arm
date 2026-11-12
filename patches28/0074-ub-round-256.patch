@@ -1,0 +1,16 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index bbdde0c..10a769e 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -10332,7 +10332,10 @@ static inline void p65_count(NvShader *sh, int st, int hit, int k, int reg, uint
+ // Uniform bounds-table entry (vec4 count the shader may read): the binding's length, rounded up to a vec4, at most 4096 (Maxwell constant buffers address 64 KB),
+ //   and at most the whole vec4s actually behind the pointer handed to the GPU this draw (cap, bytes): the widen rewritten copy, the pool buffer's end, or a deferred-update shadow.
+ //   Audit #1646 P1-65: the table used to follow the binding alone, so with a shorter copy / shadow the shader's clamp let it read past it (11-07 census: 112921 widen-copy hits in one run)
+-static inline uint32_t ubolen_vec4_cap(const p_bind_buf *u, uint64_t cap) { uint64_t v = u->addr ? (u->size + 15) / 16 : 0; if (v > 4096) v = 4096; if (v > cap / 16) v = cap / 16; return (uint32_t)v; }
++// S2Arm (fork) S2A_UB_ROUND=1: the console's driver bounds a uniform slot at its bound size rounded up to 256 bytes (nxnative 1d090a66: nvnCommandBufferBindUniformBuffer writes (size + 0xff) & ~0xff), so a shader that reads between the bound size
++//   and the next multiple of 256 gets the memory there; the host gave 0. The bounds table takes the rounded size, still capped at the bytes behind the pointer (cap) so nothing past the pool is read. Default off
++static int ub_round(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_UB_ROUND"); v = e && !strcmp(e, "1"); if (v) MLOG("uniform bounds rounded up to 256 bytes (S2A_UB_ROUND=1)"); } return v; }
++static inline uint32_t ubolen_vec4_cap(const p_bind_buf *u, uint64_t cap) { uint64_t sz_ = ub_round() && u->size ? (u->size + 255) & ~(uint64_t)255 : u->size; uint64_t v = u->addr ? (sz_ + 15) / 16 : 0; if (v > 4096) v = 4096; if (v > cap / 16) v = cap / 16; return (uint32_t)v; }
+ static inline uint32_t ubolen_vec4(const p_bind_buf *u) { return ubolen_vec4_cap(u, UINT64_MAX); }
+ typedef struct { int stage; } sbsz_ctx;
+ static uint32_t sbsz_bound(void *ctx, const nvn_rbind *b) {

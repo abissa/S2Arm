@@ -1,0 +1,53 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 4e858eb..52ebd71 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -13933,6 +13933,33 @@ static int gmem_uses(NvShader *s) {
+ }
+ static void gmem_count_draw(NvProg *pr) { g_gmem_draws_all++; for (int i = 0; i < 5; i++) if (gmem_uses(pr->sh[i])) { g_gmem_draws++; break; } }
+ 
++// S2Arm (fork) S2A_TEXSAVE=<frame>: at the first draw of that frame, every sparse 2D array texture bound to a pixel shader slot is sampled layer by layer at mip levels 0 and 5 into a contact sheet (8 columns of 128 px tiles),
++//   saved as <documents>/shots/tex_<serial*10+level>.png. Levels that are not mapped / not filled show as black or wrong: looks for the fine data of the scenery arrays (Mario Kart World's 8192x8192x68 textures)
++static void fit_shot_png(const char *name, int k, uint64_t n, const char *what, const uint8_t *p, size_t w, size_t h, size_t row);
++static void texsave_one(id<MTLTexture> t, uint64_t ser, unsigned level) {
++    @autoreleasepool {
++        unsigned layers = (unsigned)t.arrayLength, cols = 8, rows = (layers + cols - 1) / cols, tile = 128; if (!layers || layers > 256) return;
++        static id<MTLRenderPipelineState> ps; static id<MTLCommandQueue> q;
++        if (!ps) { NSError *er = nil;
++            NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\nstruct VO { float4 p [[position]]; float2 uv; };\n"
++                "vertex VO tv(uint v [[vertex_id]]) { float2 q = float2((v << 1) & 2, v & 2); VO o; o.p = float4(q * 2.0 - 1.0, 0, 1); o.uv = float2(q.x, 1.0 - q.y); return o; }\n"
++                "fragment float4 tf(VO i [[stage_in]], texture2d_array<float> t [[texture(0)]], constant uint2 &a [[buffer(0)]]) { constexpr sampler s(filter::linear, mip_filter::nearest); return float4(t.sample(s, i.uv, a.x, level(float(a.y))).rgb, 1.0); }\n";
++            id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&er]; if (!lib) { MLOG("[texsave] library: %s", er.localizedDescription.UTF8String); return; }
++            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"tv"]; pd.fragmentFunction = [lib newFunctionWithName:@"tf"]; pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
++            ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&er]; if (!ps) { MLOG("[texsave] pipeline: %s", er.localizedDescription.UTF8String); return; }
++            q = [g_dev newCommandQueue]; if (g_res) [q addResidencySet:g_res]; }
++        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:cols * tile height:rows * tile mipmapped:NO];
++        td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModeShared; id<MTLTexture> out = [g_dev newTextureWithDescriptor:td]; if (!out) return;
++        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor]; rp.colorAttachments[0].texture = out; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 1, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp]; [e setRenderPipelineState:ps]; [e setFragmentTexture:t atIndex:0];
++        for (unsigned l = 0; l < layers; l++) { MTLViewport vp = { (double)((l % cols) * tile), (double)((l / cols) * tile), (double)tile, (double)tile, 0, 1 }; [e setViewport:vp]; uint32_t a[2] = { l, level }; [e setFragmentBytes:a length:8 atIndex:0]; [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; }
++        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
++        if (cb.status != MTLCommandBufferStatusCompleted) { MLOG("[texsave] ser %llu level %u: command buffer status %d", (unsigned long long)ser, level, (int)cb.status); return; }
++        size_t row = (size_t)cols * tile * 4; uint8_t *buf = malloc(row * rows * tile); if (!buf) return;
++        [out getBytes:buf bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, cols * tile, rows * tile) mipmapLevel:0];
++        fit_shot_png("tex", (int)(ser * 10 + level), 0, "tex", buf, cols * tile, rows * tile, row); free(buf);
++    }
++}
+ // S2Arm (fork) S2A_SKIP_DISP / S2A_SKIP_COPY=<first frame>:<a>-<b>,...: the same schedule as S2A_SKIP_SCHED, for compute dispatches and for texture / buffer copies (one count per frame each): in frame first+k the operations
+ //   a..b of that frame are dropped. Used to find what writes the flat "wall" that no draw paints (Mario Kart World). The picture is wrong on purpose
+ typedef struct { const char *env; const char *name; long first; int n; long a[128], b[128]; long lastf, cnt; int init; } ss_t;
+@@ -14020,6 +14047,14 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+               if (found_) continue; seen_[i_] = h_; nl_++;
+               MLOG("[texdump] fs %s st%d reg%u tid %d ser %llu %ux%ux%u fmt %#x tgt %d lv %u fl %#x", pr->sh[1]->key, st_, rg_, tid_, (unsigned long long)x_->serial, (unsigned)x_->d.width, (unsigned)x_->d.height, (unsigned)x_->d.depth,
+                    (unsigned)x_->d.format, (int)x_->d.target, (unsigned)x_->d.levels, (unsigned)x_->d.flags); } } } }
++    // S2Arm (fork) S2A_TEXSAVE=<frame> (see texsave_one): once, at the first draw of that frame
++    { static long ts_f = -2; static int ts_done; if (ts_f == -2) { const char *e_ = getenv("S2A_TEXSAVE"); ts_f = e_ && *e_ ? atol(e_) : -1; }
++      if (ts_f >= 0 && !ts_done && !g_defer_replaying && (long)atomic_load(&g_cur_frame) >= ts_f) { ts_done = 1; static uint64_t sv_[16]; int nsv_ = 0;
++        for (unsigned rg_ = 0; rg_ < 24; rg_++) { int tid_ = (int)(tex_slot_h(S.tex[1], S.img[1], rg_) & 0xfffff); if (!tid_ || tid_ >= g_ntreg) continue; const tex_t *x_ = &g_treg[tid_].t;
++            if (!x_->serial || x_->d.target != 4 || !(x_->d.flags & 0x20) || x_->d.width < 2048) continue; int dup_ = 0; for (int i_ = 0; i_ < nsv_; i_++) dup_ |= sv_[i_] == x_->serial; if (dup_ || nsv_ >= 16) continue; sv_[nsv_++] = x_->serial;
++            void *tv_ = NULL; tex_fast_rid(tid_, &tv_); if (!tv_) continue; id<MTLTexture> t_ = (__bridge id<MTLTexture>)tv_;
++            MLOG("[texsave] ser %llu %ux%ux%u fmt %#x: metal type %d layers %d levels %d", (unsigned long long)x_->serial, (unsigned)x_->d.width, (unsigned)x_->d.height, (unsigned)x_->d.depth, (unsigned)x_->d.format, (int)t_.textureType, (int)t_.arrayLength, (int)t_.mipmapLevelCount);
++            if (t_.textureType == MTLTextureType2DArray) { texsave_one(t_, x_->serial, 0); texsave_one(t_, x_->serial, 5); } } } }
+     // S2Arm (fork) S2A_SKIP_SCHED=<first frame>:<a>-<b>,<a>-<b>,...: in frame first+k the draws numbered a..b of that frame (the numbering of S2A_DRAWDUMP) are dropped, k = the position in the list. One recorded run then
+     //   tests many ranges: with a defect that shows in every frame (Mario Kart World's flat "wall"), the frames where it vanishes name the range of the draw that paints it. The picture is wrong on purpose
+     { static long ss_first = -2; static int ss_n; static long ss_a[128], ss_b[128]; static long ss_lastf = -1, ss_dn;

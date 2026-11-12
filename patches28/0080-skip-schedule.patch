@@ -1,0 +1,20 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 067faa2..b289433 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -13991,6 +13991,15 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+           MLOG("[drawdump] F%ld #%ld vs %s fs %s prim %d count %d inst %d ind %d dt%d dw%d df%d wm%#x tgt %ux%u args %x,%x,%x,%x,%x addr %llx", fr_, dn_, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
+                dw ? (int)dw->prim : (int)di->prim, dw ? (int)dw->count : (int)di->count, dw ? (int)dw->instances : (int)di->instances, ia_ != 0 ? 1 : 0,
+                (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, S.chmask.mask, c0_ ? c0_->d.width : 0, c0_ ? c0_->d.height : 0, ia_ ? aw_[0] : 0, ia_ ? aw_[1] : 0, ia_ ? aw_[2] : 0, ia_ ? aw_[3] : 0, ia_ ? aw_[4] : 0, (unsigned long long)ia_); } } }
++    // S2Arm (fork) S2A_SKIP_SCHED=<first frame>:<a>-<b>,<a>-<b>,...: in frame first+k the draws numbered a..b of that frame (the numbering of S2A_DRAWDUMP) are dropped, k = the position in the list. One recorded run then
++    //   tests many ranges: with a defect that shows in every frame (Mario Kart World's flat "wall"), the frames where it vanishes name the range of the draw that paints it. The picture is wrong on purpose
++    { static long ss_first = -2; static int ss_n; static long ss_a[128], ss_b[128]; static long ss_lastf = -1, ss_dn;
++      if (ss_first == -2) { ss_first = -1; const char *e_ = getenv("S2A_SKIP_SCHED"), *c_ = e_ ? strchr(e_, ':') : NULL;
++          if (c_) { ss_first = atol(e_); for (const char *q_ = c_ + 1; *q_ && ss_n < 128;) { ss_a[ss_n] = atol(q_); const char *d_ = strchr(q_, '-'); ss_b[ss_n] = d_ ? atol(d_ + 1) : ss_a[ss_n]; ss_n++; const char *n_ = strchr(q_, ','); if (!n_) break; q_ = n_ + 1; }
++              MLOG("S2A_SKIP_SCHED: from frame %ld, %d ranges", ss_first, ss_n); } }
++      if (ss_first >= 0 && ss_n && !g_defer_replaying) { long fr_ = (long)atomic_load(&g_cur_frame);
++          if (fr_ >= ss_first && fr_ < ss_first + ss_n) { if (fr_ != ss_lastf) { ss_lastf = fr_; ss_dn = 0; static long said_; if (said_++ < 130) MLOG("[skipsched] frame %ld drops draws #%ld-#%ld", fr_, ss_a[fr_ - ss_first], ss_b[fr_ - ss_first]); }
++              ss_dn++; if (ss_dn >= ss_a[fr_ - ss_first] && ss_dn <= ss_b[fr_ - ss_first]) return; } } }
+     // Diagnostic DM_NVN_DRAW_MAX=<n> (frame replay, graphics/nvn/docs/frame_replay.md): draws past the n-th of a frame are dropped, and the n-th logs its program, blend state and targets
+     //   (DM_NVN_DRAWLOG=1: every draw up to the n-th logs it; DM_NVN_DRAW_SKIP=a-b drops the a-th to b-th draws of a frame) --
+     //   bisecting n on a replayed frame finds the draw that puts a wrong pixel on screen in seconds per step

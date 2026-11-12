@@ -1,0 +1,108 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index ff79c30..b8a644e 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -803,20 +803,22 @@ static void nvn_be_pool_add_body(const void *mem, uint64_t size) {
+     pthread_mutex_unlock(&g_mu);
+ }
+ 
++static void vs_purge(uintptr_t lo, uintptr_t hi);   // S2Arm (fork): shared tiles kept for a pool's memory (S2A_VS_RETAIN)
+ static void nvn_be_pool_del_body(const void *mem);
+ void nvn_be_pool_del(const void *mem) { @autoreleasepool { nvn_be_pool_del_body(mem); } }
+ static void nvn_be_pool_del_body(const void *mem) {
+-    g_reg_gen++;
++    g_reg_gen++; uintptr_t vlo_ = 0, vhi_ = 0;
+     pthread_mutex_lock(&g_mu);
+     // The no-copy buffer goes through deferred release (out of the residency set and unreferenced after submitted commands complete). It used to be removed only from g_keep while the residency set still held a strong reference: after the pool was freed the buffer stayed alive wrapping that guest memory,
+     // and a new pool at the same address wrapped it again. Engage's title demo cycles scenes; GPU allocated grew to 5.4 GB and resident memory to 3.6 GB in 850 s
+     for (int i = 0; i < g_npool; i++)
+-        if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; [g_keep removeObject:b]; defer_obj_release(b); if (g_pools[i].res) g_pool_res_n--;
++        if (g_pools[i].key == mem) { id<MTLBuffer> b = g_pools[i].buf; vlo_ = (uintptr_t)g_pools[i].lo; vhi_ = (uintptr_t)g_pools[i].hi; [g_keep removeObject:b]; defer_obj_release(b); if (g_pools[i].res) g_pool_res_n--;
+             if (!g_dead_pools) g_dead_pools = [NSHashTable weakObjectsHashTable];
+             gslot_put(i);
+             [g_dead_pools addObject:b]; g_pools[i] = g_pools[--g_npool]; if (i < g_npool && g_pools[i].gslot) g_gslot_pool[g_pools[i].gslot - 1] = i;   // the moved pool's bit follows it
+             g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); break; }
+     pthread_mutex_unlock(&g_mu);
++    if (vhi_) vs_purge(vlo_, vhi_);   // after the pool lock: the tile lock is taken
+ }
+ 
+ // Address → pool: the last hit first, then a binary search over indices sorted by start address, and a full linear scan only when that fails (pools overlapping).
+@@ -3306,7 +3308,7 @@ static void sparse_map_pending(SpInfo *spi, id<MTLTexture> mt);
+ static NSHashTable *g_sp_all;   // (declared again where it is defined below)
+ #define VS_HEAP_TILES 4096u   // a 256 MB heap of 64 KB tiles
+ enum { VS_HN = 1 << 18 };
+-typedef struct { uintptr_t key; uint32_t fmt, rc; } vs_tab_t;
++typedef struct { uintptr_t key; uint32_t fmt, rc, rn, rp; uint8_t ret; } vs_tab_t;   // rn / rp / ret: the list of retained tiles (S2A_VS_RETAIN)
+ typedef struct { uintptr_t key; uint32_t fmt, slot1; } vs_h_t;   // slot1: 0 empty, ~0 deleted
+ static pthread_mutex_t g_vs_mu = PTHREAD_MUTEX_INITIALIZER;
+ static NSMutableArray *g_vs_heaps; static vs_tab_t *g_vs_tab; static vs_h_t *g_vs_h;
+@@ -3329,6 +3331,35 @@ static void vs_del(uintptr_t k, uint32_t f) {
+     if (!g_vs_h) return;
+     for (uint32_t p = 0, i = vs_hash(k, f); p < VS_HN; p++, i = (i + 1) & (VS_HN - 1)) { vs_h_t *e = &g_vs_h[i]; if (!e->slot1) return; if (e->slot1 != ~0u && e->key == k && e->fmt == f) { e->slot1 = ~0u; return; } }
+ }
++// S2Arm (fork) S2A_VS_RETAIN=<tiles> (default 0 = off): a tile freed when no texture maps its physical memory any more is kept, keyed by that memory, and handed back when a texture maps the memory again, with what it held.
++//   On the console the physical memory keeps its content when the game unmaps it everywhere and maps it again later; without this the tile went back to the free list and the memory came back as another chunk's old texels
++//   or zeros (kartnative's open candidate for Mario Kart World's pop-in: GPU-written sparse textures lose their content on a remap; nxnative documents it as a limit). The oldest are given up past the cap and when their pool goes
++static uint64_t g_vs_nret, g_vs_ret_hits, g_vs_ret_evict, g_vs_ret_purged; static uint32_t g_vs_rhead = ~0u, g_vs_rtail = ~0u;
++static uint64_t vs_ret_cap(void) { static long v = -1; if (v < 0) { const char *e = getenv("S2A_VS_RETAIN"); v = e && *e ? atol(e) : 0; if (v < 0) v = 0; MLOG("shared tiles: up to %ld freed tiles kept by their physical memory (S2A_VS_RETAIN)", v); } return (uint64_t)v; }
++static void vs_push_late(uint32_t slot) {
++    if (g_vs_nlate == g_vs_latecap) { g_vs_latecap = g_vs_latecap ? 2 * g_vs_latecap : 1024; g_vs_late = realloc(g_vs_late, g_vs_latecap * sizeof *g_vs_late); if (!g_vs_late) MDIE("the shared tile free list"); }
++    g_vs_late[g_vs_nlate++] = (struct vs_late){slot, g_fence + 1};
++}
++static void vs_unlink(uint32_t slot) {
++    vs_tab_t *e = &g_vs_tab[slot]; if (!e->ret) return;
++    if (e->rp != ~0u) g_vs_tab[e->rp].rn = e->rn; else g_vs_rhead = e->rn;
++    if (e->rn != ~0u) g_vs_tab[e->rn].rp = e->rp; else g_vs_rtail = e->rp;
++    e->ret = 0; e->rn = e->rp = ~0u; g_vs_nret--;
++}
++static void vs_retain(uint32_t slot) {
++    vs_tab_t *e = &g_vs_tab[slot]; e->ret = 1; e->rn = ~0u; e->rp = g_vs_rtail;
++    if (g_vs_rtail != ~0u) g_vs_tab[g_vs_rtail].rn = slot; else g_vs_rhead = slot;
++    g_vs_rtail = slot; g_vs_nret++;
++}
++static void vs_drop_retained(uint32_t s) {   // a retained tile goes back to the free list (once past the fence)
++    vs_tab_t *e = &g_vs_tab[s]; vs_unlink(s); if (e->key) vs_del(e->key, e->fmt); e->key = 0; e->rc = 0; vs_push_late(s); g_vs_live--;
++}
++static void vs_evict_one(void) { if (g_vs_rhead == ~0u) return; vs_drop_retained(g_vs_rhead); g_vs_ret_evict++; }
++static void vs_purge(uintptr_t lo, uintptr_t hi) {   // a memory pool went: tiles kept for its memory are no longer that memory
++    pthread_mutex_lock(&g_vs_mu);
++    for (uint32_t s = g_vs_rhead; s != ~0u;) { uint32_t nx = g_vs_tab[s].rn; if (g_vs_tab[s].key >= lo && g_vs_tab[s].key < hi) { vs_drop_retained(s); g_vs_ret_purged++; } s = nx; }
++    pthread_mutex_unlock(&g_vs_mu);
++}
+ static int vs_alloc(uint32_t *out) {   // caller holds g_vs_mu
+     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); size_t k = 0;
+     for (size_t i = 0; i < g_vs_nlate; i++) {
+@@ -3355,10 +3386,10 @@ static int vs_alloc(uint32_t *out) {   // caller holds g_vs_mu
+ }
+ static void vs_release(uint32_t slot) {   // caller holds g_vs_mu; the GPU may still read the tile through work already committed: it is free once past the next fence
+     vs_tab_t *e = &g_vs_tab[slot]; if (e->rc > 1) { e->rc--; return; }
++    if (e->key && vs_ret_cap()) { e->rc = 0; vs_retain(slot); while (g_vs_nret > vs_ret_cap()) vs_evict_one(); return; }   // S2A_VS_RETAIN: kept by its physical memory
+     if (e->key) vs_del(e->key, e->fmt);
+     e->rc = 0; e->key = 0;
+-    if (g_vs_nlate == g_vs_latecap) { g_vs_latecap = g_vs_latecap ? 2 * g_vs_latecap : 1024; g_vs_late = realloc(g_vs_late, g_vs_latecap * sizeof *g_vs_late); if (!g_vs_late) MDIE("the shared tile free list"); }
+-    g_vs_late[g_vs_nlate++] = (struct vs_late){slot, g_fence + 1}; g_vs_live--;
++    vs_push_late(slot); g_vs_live--;
+ }
+ static void vs_dealloc(SpInfo *s) {
+     if (!s->sh) return;
+@@ -3405,7 +3436,7 @@ static void sparse_map_shared(SpInfo *s, id<MTLTexture> mt) {
+             if (s->sslot[i]) { if (has) vs_op(&un, (MTL4UpdateSparseTextureMappingOperation){MTLSparseTextureMappingModeUnmap, rg, lev, sl, 0}); vs_release(s->sslot[i] - 1); s->sslot[i] = 0; nun++; }
+             if (!s->nkey[i] || !has) continue;
+             uintptr_t key = s->nkey[i] & ~(uintptr_t)1; int priv = (int)(s->nkey[i] & 1); uint32_t slot = priv ? ~0u : vs_find(key, s->td.format);
+-            if (slot != ~0u) { g_vs_tab[slot].rc++; nsh++; g_vs_shared++; }
++            if (slot != ~0u) { if (g_vs_tab[slot].ret) { vs_unlink(slot); g_vs_ret_hits++; } g_vs_tab[slot].rc++; nsh++; g_vs_shared++; }
+             else { if (priv) g_vs_priv++; else { int seen = 0; for (int q_ = 0; q_ < g_vs_nfmts; q_++) { if (g_vs_fmts[q_] == s->td.format) seen = 1; else if (vs_find(key, g_vs_fmts[q_]) != ~0u) g_vs_xfmt++; } if (!seen && g_vs_nfmts < 8) g_vs_fmts[g_vs_nfmts++] = s->td.format; }
+                    if (!vs_alloc(&slot)) { nfail++; continue; } if (!priv) { g_vs_tab[slot].key = key; g_vs_tab[slot].fmt = s->td.format; vs_put(key, s->td.format, slot); } }
+             uint32_t hi = slot / VS_HEAP_TILES;
+@@ -3430,9 +3461,9 @@ static void sparse_map_shared(SpInfo *s, id<MTLTexture> mt) {
+ static void vs_report(uint64_t fr) {
+     if (!g_vs_heaps) return;
+     uint64_t chunks = 0, nt = 0; for (id<MTLTexture> mt in g_sp_all) { SpInfo *s = sp_info(mt); if (!s || !s->sh || !s->sslot) continue; nt++; for (uint64_t i = 0; i < s->nchunks; i++) chunks += s->sslot[i] != 0; }
+-    MLOG("[vt-heap-report] frame %llu: %llu shared tiles live (%llu MB) for %llu mapped chunks of %llu textures (%.2f places a tile); peak %llu; %llu onto an existing slot in all, %llu maps, %llu unmaps, %llu tiles reused; %lu heaps (%lu MB), device allocation %llu MB; chunks with a slot of their own (scattered pages) %llu, chunks whose memory another format already holds %llu",
++    MLOG("[vt-heap-report] frame %llu: %llu shared tiles live (%llu MB) for %llu mapped chunks of %llu textures (%.2f places a tile); peak %llu; %llu onto an existing slot in all, %llu maps, %llu unmaps, %llu tiles reused; %lu heaps (%lu MB), device allocation %llu MB; chunks with a slot of their own (scattered pages) %llu, chunks whose memory another format already holds %llu; tiles kept %llu, handed back on a remap %llu, given up %llu, purged with a pool %llu",
+          (unsigned long long)fr, (unsigned long long)g_vs_live, (unsigned long long)(g_vs_live >> 4), (unsigned long long)chunks, (unsigned long long)nt, g_vs_live ? (double)chunks / (double)g_vs_live : 0.0, (unsigned long long)g_vs_peak,
+-         (unsigned long long)g_vs_shared, (unsigned long long)g_vs_maps, (unsigned long long)g_vs_unmaps, (unsigned long long)g_vs_reused, (unsigned long)g_vs_heaps.count, (unsigned long)(g_vs_heaps.count * 256), (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)g_vs_priv, (unsigned long long)g_vs_xfmt);
++         (unsigned long long)g_vs_shared, (unsigned long long)g_vs_maps, (unsigned long long)g_vs_unmaps, (unsigned long long)g_vs_reused, (unsigned long)g_vs_heaps.count, (unsigned long)(g_vs_heaps.count * 256), (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)g_vs_priv, (unsigned long long)g_vs_xfmt, (unsigned long long)g_vs_nret, (unsigned long long)g_vs_ret_hits, (unsigned long long)g_vs_ret_evict, (unsigned long long)g_vs_ret_purged);
+ }
+ // A GPU sparse texture of a terrain pool as a placement sparse texture of shared tiles; nil: not eligible (Metal's 64 KB tile must be the NVN tile, whole layers of 64 KB chunks, a mip tail of one tile): the old path
+ static id<MTLTexture> vs_create(const tex_t *t, MTLTextureDescriptor *d) {

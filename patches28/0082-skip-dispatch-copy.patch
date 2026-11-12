@@ -1,0 +1,59 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 006eb2f..a7cfb7b 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -13933,6 +13933,22 @@ static int gmem_uses(NvShader *s) {
+ }
+ static void gmem_count_draw(NvProg *pr) { g_gmem_draws_all++; for (int i = 0; i < 5; i++) if (gmem_uses(pr->sh[i])) { g_gmem_draws++; break; } }
+ 
++// S2Arm (fork) S2A_SKIP_DISP / S2A_SKIP_COPY=<first frame>:<a>-<b>,...: the same schedule as S2A_SKIP_SCHED, for compute dispatches and for texture / buffer copies (one count per frame each): in frame first+k the operations
++//   a..b of that frame are dropped. Used to find what writes the flat "wall" that no draw paints (Mario Kart World). The picture is wrong on purpose
++typedef struct { const char *env; const char *name; long first; int n; long a[128], b[128]; long lastf, cnt; int init; } ss_t;
++static int ss_hit(ss_t *s) {
++    if (!s->init) { s->init = 1; s->first = -1; s->lastf = -1; const char *e_ = getenv(s->env), *c_ = e_ ? strchr(e_, 58) : NULL;
++        if (c_) { s->first = atol(e_); for (const char *q_ = c_ + 1; *q_ && s->n < 128;) { s->a[s->n] = atol(q_); const char *d_ = strchr(q_, 45); s->b[s->n] = d_ ? atol(d_ + 1) : s->a[s->n]; s->n++; const char *n_ = strchr(q_, 44); if (!n_) break; q_ = n_ + 1; }
++            MLOG("%s: from frame %ld, %d ranges", s->env, s->first, s->n); } }
++    if (s->first < 0 || !s->n || g_defer_replaying) return 0;
++    long fr_ = (long)atomic_load(&g_cur_frame);
++    if (fr_ != s->lastf) { if (s->lastf >= s->first && s->lastf < s->first + s->n) MLOG("[%s] frame %ld saw %ld ops", s->name, s->lastf, s->cnt); s->lastf = fr_; s->cnt = 0;
++        if (fr_ >= s->first && fr_ < s->first + s->n) MLOG("[%s] frame %ld drops ops #%ld-#%ld", s->name, fr_, s->a[fr_ - s->first], s->b[fr_ - s->first]); }
++    s->cnt++;
++    if (fr_ < s->first || fr_ >= s->first + s->n) return 0;
++    return s->cnt >= s->a[fr_ - s->first] && s->cnt <= s->b[fr_ - s->first];
++}
++static ss_t g_ss_disp = { "S2A_SKIP_DISP", "skipdisp" }, g_ss_copy = { "S2A_SKIP_COPY", "skipcopy" };
+ static void draw(const p_draw *dw, const p_draw_idx *di) {
+     if (dw && dw->prim == DM_PRIM_MESH_TASKS && !g_mtk.on) { mesh_tasks_draw(dw); return; }   // NVN2 task / mesh draw: binds its stages and comes back with its pixel stage (nvn_geometry.inc)
+     g_udc_precise = 0;   // only this draw's own udc_note_draw may cover its encode (a draw that returned without encoding leaves no stale cover)
+@@ -14396,6 +14412,7 @@ static void dispatch(const p_dispatch *dp) {
+     geo_run_flush();
+     zskip_clear();
+     g_wr_epoch++; g_mdx_epoch++;
++    if (ss_hit(&g_ss_disp)) return;
+     if (!S.cprog) { RED_ONCE(27, "no program bound before the dispatch"); return; }
+     // DispatchComputeIndirect: the group counts {x, y, z} at ind (MTLDispatchThreadgroupsIndirectArguments) are usually written by the GPU earlier in the frame; Metal reads them when the dispatch runs
+     void *ib = NULL; uint64_t io = 0, ig = 0;
+@@ -14556,6 +14573,7 @@ static int fold_copy_skip(const tex_t *t, const char *what) {
+     RED_ONCE(142, "%s with folded linear texture ser=%llu %ux%u skipped (first case)", what, (unsigned long long)t->serial, t->d.width, t->d.height); return 1;
+ }
+ static void copy_t2b(const p_copy_b2t *c) {
++    if (ss_hit(&g_ss_copy)) return;
+     if (fold_copy_skip(c->tex, "texture→buffer copy")) return;
+     g_wr_epoch++; g_mdx_epoch++;
+     if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "texture-to-buffer copy");
+@@ -14663,6 +14681,7 @@ int nvn_be_tex_storage_read(const void *nvntex, uint8_t *dst, size_t row) {
+ }
+ void nvn_be_rs_mark_bad(const void *nvntex) { const tex_t *t = nvntex; if (t && t->magic == MAGIC('T', 'E', 'X', 0)) rs_bad(tex_mtl(t), "测试标记"); }
+ static void copy_b2t(const p_copy_b2t *c) {
++    if (ss_hit(&g_ss_copy)) return;
+     if (c->tex && c->tex->pool && (c->tex->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) { static uint64_t n_; n_++; if (n_ <= 40 || n_ % 1000 == 0) MLOG("[vt-copy] buffer -> texture #%llu frame %llu: ser=%llu %ux%ux%u format %#x pool flags %#x, region %d,%d,%d %dx%dx%d level %u", (unsigned long long)n_, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.depth, (unsigned)c->tex->d.format, c->tex->pool->flags, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->has_view && c->view.set_levels ? (unsigned)c->view.base_level : 0u); }   // S2Arm (fork) diagnostic
+     if (fold_copy_skip(c->tex, "buffer→texture copy")) return;
+     if (c->tex) zskip_del(c->tex->serial);
+@@ -14810,6 +14829,7 @@ static uint64_t g_wd_copy_full, g_wd_copy_part;
+ static void copy_t2t_(const p_copy_t2t *c);
+ static void dlss_eval(const p_dlss *d, uint32_t size);   // nvn_dlss.inc
+ static void copy_t2t(const p_copy_t2t *c) {
++    if (ss_hit(&g_ss_copy)) return;
+     { int sv_ = c->src && c->src->pool && (c->src->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL), dv_ = c->dst && c->dst->pool && (c->dst->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL);
+       if (sv_ || dv_) { static uint64_t n_; n_++; if (n_ <= 40 || n_ % 1000 == 0) MLOG("[vt-copy] texture -> texture #%llu frame %llu: src ser=%llu %ux%u format %#x%s -> dst ser=%llu %ux%u format %#x%s, region %dx%dx%d", (unsigned long long)n_, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->src->serial, c->src->d.width, c->src->d.height, (unsigned)c->src->d.format, sv_ ? " (virtual pool)" : "", (unsigned long long)c->dst->serial, c->dst->d.width, c->dst->d.height, (unsigned)c->dst->d.format, dv_ ? " (virtual pool)" : "", c->dr.width, c->dr.height, c->dr.depth); } }   // S2Arm (fork) diagnostic
+     // GPU 写出的贴图拷到别处，目标也是 GPU 内容，不当 16:9 原比例页的来源（核心按 src 判：CPU 供图拷来拷去仍是图片；10-26 八方2 场景图）

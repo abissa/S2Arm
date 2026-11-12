@@ -1,0 +1,27 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 8c2cffb..5691583 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -4790,6 +4790,7 @@ static void sp_tiles_report(uint64_t fr) {
+              (unsigned long long)fr, s->td.width, s->td.height, s->layers, s->td.format, (unsigned long long)s->used, (unsigned long long)s->cap, (unsigned long long)(s->hbytes >> 20), (unsigned long long)nm, (unsigned long long)s->nchunks,
+              (unsigned long long)s->c_map, (unsigned long long)s->c_un, (unsigned long long)s->c_full, (unsigned long long)dg); }
+ }
++int nvn_host_readable(uint64_t a, uint64_t n);   // hle_nvn.c: the host can read n bytes at that guest address (sparse pools: only where mapped)
+ static void sky_probe(uint64_t fr); static void cull_report(uint64_t fr); static void mesh_report(uint64_t fr);   // S2Arm (fork) render diagnostics (defined before dispatch)
+ static void mem_report(void) {
+     uint64_t fr = atomic_load(&g_cur_frame); sp_tiles_report(fr); vs_report(fr); cull_report(fr); mesh_report(fr); sky_probe(fr);
+@@ -13938,9 +13939,11 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+       if (f0_ >= 0 && !g_defer_replaying) { long fr_ = (long)atomic_load(&g_cur_frame);
+         if (fr_ >= f0_ && fr_ <= f1_) { if (fr_ != lastf_) { lastf_ = fr_; dn_ = 0; } dn_++;
+           const tex_t *c0_ = R.has_rt && R.rt.n > 0 ? R.rt.color[0] : NULL;
+-          MLOG("[drawdump] F%ld #%ld vs %s fs %s prim %d count %d inst %d ind %d dt%d dw%d df%d wm%#x tgt %ux%u", fr_, dn_, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
+-               dw ? (int)dw->prim : (int)di->prim, dw ? (int)dw->count : (int)di->count, dw ? (int)dw->instances : (int)di->instances, (dw ? dw->ind : di->ind) != 0 ? 1 : 0,
+-               (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, S.chmask.mask, c0_ ? c0_->d.width : 0, c0_ ? c0_->d.height : 0); } } }
++          uint64_t ia_ = dw ? (uint64_t)dw->ind : (uint64_t)di->ind; uint32_t aw_[5] = {0xdead, 0xdead, 0xdead, 0xdead, 0xdead};   // the indirect record as the GPU left it in memory (frames behind): count, instances, first, ...
++          if (ia_ && nvn_host_readable(ia_, 20)) memcpy(aw_, (const void *)(uintptr_t)ia_, 20);
++          MLOG("[drawdump] F%ld #%ld vs %s fs %s prim %d count %d inst %d ind %d dt%d dw%d df%d wm%#x tgt %ux%u args %x,%x,%x,%x,%x addr %llx", fr_, dn_, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
++               dw ? (int)dw->prim : (int)di->prim, dw ? (int)dw->count : (int)di->count, dw ? (int)dw->instances : (int)di->instances, ia_ != 0 ? 1 : 0,
++               (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, S.chmask.mask, c0_ ? c0_->d.width : 0, c0_ ? c0_->d.height : 0, ia_ ? aw_[0] : 0, ia_ ? aw_[1] : 0, ia_ ? aw_[2] : 0, ia_ ? aw_[3] : 0, ia_ ? aw_[4] : 0, (unsigned long long)ia_); } } }
+     // Diagnostic DM_NVN_DRAW_MAX=<n> (frame replay, graphics/nvn/docs/frame_replay.md): draws past the n-th of a frame are dropped, and the n-th logs its program, blend state and targets
+     //   (DM_NVN_DRAWLOG=1: every draw up to the n-th logs it; DM_NVN_DRAW_SKIP=a-b drops the a-th to b-th draws of a frame) --
+     //   bisecting n on a replayed frame finds the draw that puts a wrong pixel on screen in seconds per step

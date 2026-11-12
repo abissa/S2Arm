@@ -1,0 +1,13 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index b289433..006eb2f 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -2100,7 +2100,7 @@ __attribute__((constructor)) static void s2a_switches_load(void) {
+     const char *dd = getenv("S2A_DOCS"), *hh = getenv("HOME"); char p[1200];
+     if (dd && *dd) snprintf(p, sizeof p, "%s/s2a_switches.txt", dd); else if (hh && *hh) snprintf(p, sizeof p, "%s/Documents/s2a_switches.txt", hh); else return;
+     FILE *f = fopen(p, "r"); if (!f) return;
+-    char ln[300]; size_t o = 0;
++    char ln[8192]; size_t o = 0;   // 0081: was 300 (a longer line, e.g. S2A_SKIP_SCHED with 100 ranges, was cut after ~40 entries)
+     while (fgets(ln, sizeof ln, f)) {
+         char *s = ln; while (*s == ' ' || *s == 9) s++;
+         if (!*s || *s == '#' || *s == 10 || *s == 13) continue;

@@ -1,0 +1,19 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 52ebd71..fe2d8fa 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -14049,12 +14049,12 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+                    (unsigned)x_->d.format, (int)x_->d.target, (unsigned)x_->d.levels, (unsigned)x_->d.flags); } } } }
+     // S2Arm (fork) S2A_TEXSAVE=<frame> (see texsave_one): once, at the first draw of that frame
+     { static long ts_f = -2; static int ts_done; if (ts_f == -2) { const char *e_ = getenv("S2A_TEXSAVE"); ts_f = e_ && *e_ ? atol(e_) : -1; }
+-      if (ts_f >= 0 && !ts_done && !g_defer_replaying && (long)atomic_load(&g_cur_frame) >= ts_f) { ts_done = 1; static uint64_t sv_[16]; int nsv_ = 0;
++      if (ts_f >= 0 && !ts_done && !g_defer_replaying && (long)atomic_load(&g_cur_frame) >= ts_f) { static uint64_t sv_[16]; int nsv_ = 0;
+         for (unsigned rg_ = 0; rg_ < 24; rg_++) { int tid_ = (int)(tex_slot_h(S.tex[1], S.img[1], rg_) & 0xfffff); if (!tid_ || tid_ >= g_ntreg) continue; const tex_t *x_ = &g_treg[tid_].t;
+             if (!x_->serial || x_->d.target != 4 || !(x_->d.flags & 0x20) || x_->d.width < 2048) continue; int dup_ = 0; for (int i_ = 0; i_ < nsv_; i_++) dup_ |= sv_[i_] == x_->serial; if (dup_ || nsv_ >= 16) continue; sv_[nsv_++] = x_->serial;
+             void *tv_ = NULL; tex_fast_rid(tid_, &tv_); if (!tv_) continue; id<MTLTexture> t_ = (__bridge id<MTLTexture>)tv_;
+             MLOG("[texsave] ser %llu %ux%ux%u fmt %#x: metal type %d layers %d levels %d", (unsigned long long)x_->serial, (unsigned)x_->d.width, (unsigned)x_->d.height, (unsigned)x_->d.depth, (unsigned)x_->d.format, (int)t_.textureType, (int)t_.arrayLength, (int)t_.mipmapLevelCount);
+-            if (t_.textureType == MTLTextureType2DArray) { texsave_one(t_, x_->serial, 0); texsave_one(t_, x_->serial, 5); } } } }
++            if (t_.textureType == MTLTextureType2DArray) { texsave_one(t_, x_->serial, 0); texsave_one(t_, x_->serial, 5); ts_done = 1; } } } }
+     // S2Arm (fork) S2A_SKIP_SCHED=<first frame>:<a>-<b>,<a>-<b>,...: in frame first+k the draws numbered a..b of that frame (the numbering of S2A_DRAWDUMP) are dropped, k = the position in the list. One recorded run then
+     //   tests many ranges: with a defect that shows in every frame (Mario Kart World's flat "wall"), the frames where it vanishes name the range of the draw that paints it. The picture is wrong on purpose
+     { static long ss_first = -2; static int ss_n; static long ss_a[128], ss_b[128]; static long ss_lastf = -1, ss_dn;

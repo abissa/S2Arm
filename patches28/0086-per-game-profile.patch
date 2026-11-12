@@ -1,0 +1,41 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index fe2d8fa..72ef406 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -6069,8 +6069,36 @@ static NSString *exe_rel(const char *rel) {
+ static void shmap_load_once(void);
+ static void shmap_load(void) { static dispatch_once_t once; dispatch_once(&once, ^{ shmap_load_once(); }); }   // S2Arm: also read from game threads (mtl_shmap_known at ProgramSetShaders)
+ static NSString *shmap_path(void) { const char *e = getenv("DM_NVN_SHMAP"); return e ? @(e) : exe_rel([NSString stringWithFormat:@"../games/%s/shader_map.tsv", DM_GAME_ID].UTF8String); }
++// S2Arm (fork, 0086): per-game switch profile. The game's own folder may hold s2a_switches.txt (same NAME=VALUE format, # comments); each line becomes an environment variable unless
++//   the launch, or the global <Documents>/s2a_switches.txt read before main, already set it (so a game's file only fills in what the global file leaves open: put a shared test in the
++//   global file, a per-game setting in the game's file). The game id is read from the package path in DM_NVN_SHMAP (".../games/<16 hex>/..."); read once at the first shader-map load, before any pipeline or draw.
++//   Built-in per-game defaults go in s2a_profile_builtin (none yet: every game keeps today's behaviour unless its file asks otherwise)
++static void s2a_profile_builtin(const char *id) { (void)id; }
++static void s2a_profile_load(void) {
++    const char *sm = getenv("DM_NVN_SHMAP"); if (!sm) return;
++    const char *g = strstr(sm, "/games/"); if (!g) return;
++    const char *gid = g + 7; size_t n = 0; while (n < 16 && gid[n] && gid[n] != '/') n++;
++    if (n != 16 || gid[16] != '/') return;
++    char id[17]; memcpy(id, gid, 16); id[16] = 0;
++    s2a_profile_builtin(id);
++    char p[1300]; snprintf(p, sizeof p, "%.*s/games/%s/s2a_switches.txt", (int)(g - sm), sm, id);
++    FILE *f = fopen(p, "r"); if (!f) { MLOG("[s2a] profile %s: no s2a_switches.txt in the game folder", id); return; }
++    char ln[8192]; int cnt = 0;
++    while (fgets(ln, sizeof ln, f)) {
++        char *s = ln; while (*s == ' ' || *s == 9) s++;
++        if (!*s || *s == '#' || *s == 10 || *s == 13) continue;
++        char *eq = strchr(s, '='); if (!eq) continue;
++        *eq = 0; char *v = eq + 1; v[strcspn(v, "\r\n")] = 0;
++        size_t kl = strlen(s); while (kl && (s[kl - 1] == ' ' || s[kl - 1] == 9)) s[--kl] = 0;
++        if (!*s) continue;
++        int had = getenv(s) != NULL; if (!had) setenv(s, v, 0);
++        MLOG("[s2a] profile %s: %s=%s%s", id, s, v, had ? " (already set, kept)" : ""); cnt++;
++    }
++    fclose(f); MLOG("[s2a] profile %s: %d line(s) from %s", id, cnt, p);
++}
+ static void shmap_load_once(void) {
+     if (g_shmap) return;
++    { static int pl; if (!pl) { pl = 1; s2a_profile_load(); } }
+     NSString *path = shmap_path();   // default: the current game profile folder (Mac: dm/games/<id>; on iOS main.m sets DM_NVN_SHMAP)
+     NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+     // Switch 2 bring-up (nvn2.h): the Ampere shader library is not built yet; an absent map is an empty one (every shader reported missing, its draws skipped) so the device,

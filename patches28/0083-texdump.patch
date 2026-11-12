@@ -1,0 +1,24 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index a7cfb7b..4e858eb 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -14007,6 +14007,19 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
+           MLOG("[drawdump] F%ld #%ld vs %s fs %s prim %d count %d inst %d ind %d dt%d dw%d df%d wm%#x tgt %ux%u args %x,%x,%x,%x,%x addr %llx", fr_, dn_, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
+                dw ? (int)dw->prim : (int)di->prim, dw ? (int)dw->count : (int)di->count, dw ? (int)dw->instances : (int)di->instances, ia_ != 0 ? 1 : 0,
+                (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, S.chmask.mask, c0_ ? c0_->d.width : 0, c0_ ? c0_->d.height : 0, ia_ ? aw_[0] : 0, ia_ ? aw_[1] : 0, ia_ ? aw_[2] : 0, ia_ ? aw_[3] : 0, ia_ ? aw_[4] : 0, (unsigned long long)ia_); } } }
++    // S2Arm (fork) S2A_TEXDUMP=<first frame>-<last frame>: for each (pixel shader, texture) pair of those frames, one line with the texture's shape (size, format, mip levels, target, flags): looks for a layout the host
++    //   code does not cover (the streaked cliffs were a layered sparse texture's layer size). Textures reached through a pool table (not a fixed slot) are not listed
++    { static long t0_ = -2, t1_; static uint64_t seen_[8192]; static int nl_;
++      if (t0_ == -2) { const char *e_ = getenv("S2A_TEXDUMP"); t0_ = e_ && *e_ ? atol(e_) : -1; t1_ = e_ && strchr(e_, 45) ? atol(strchr(e_, 45) + 1) : t0_; if (t0_ >= 0) MLOG("S2A_TEXDUMP: textures of frames %ld to %ld", t0_, t1_); }
++      if (t0_ >= 0 && !g_defer_replaying && nl_ < 4000) { long fr_ = (long)atomic_load(&g_cur_frame);
++        if (fr_ >= t0_ && fr_ <= t1_ && pr->sh[1]) { uint64_t kh_ = 1469598103934665603ull; for (const char *k_ = pr->sh[1]->key; *k_; k_++) kh_ = (kh_ ^ (uint8_t)*k_) * 1099511628211ull;
++          for (int st_ = 0; st_ < 2; st_++) for (unsigned rg_ = 0; rg_ < 24; rg_++) { int tid_ = (int)(tex_slot_h(S.tex[st_], S.img[st_], rg_) & 0xfffff); if (!tid_ || tid_ >= g_ntreg) continue;
++              const tex_t *x_ = &g_treg[tid_].t; if (!x_->serial) continue;
++              uint64_t h_ = (kh_ ^ (x_->serial * 0x9e3779b97f4a7c15ull)) | 1; size_t i_ = (size_t)(h_ % 8192), n_ = 0; int found_ = 0;
++              while (n_++ < 8192 && seen_[i_]) { if (seen_[i_] == h_) { found_ = 1; break; } i_ = (i_ + 1) % 8192; }
++              if (found_) continue; seen_[i_] = h_; nl_++;
++              MLOG("[texdump] fs %s st%d reg%u tid %d ser %llu %ux%ux%u fmt %#x tgt %d lv %u fl %#x", pr->sh[1]->key, st_, rg_, tid_, (unsigned long long)x_->serial, (unsigned)x_->d.width, (unsigned)x_->d.height, (unsigned)x_->d.depth,
++                   (unsigned)x_->d.format, (int)x_->d.target, (unsigned)x_->d.levels, (unsigned)x_->d.flags); } } } }
+     // S2Arm (fork) S2A_SKIP_SCHED=<first frame>:<a>-<b>,<a>-<b>,...: in frame first+k the draws numbered a..b of that frame (the numbering of S2A_DRAWDUMP) are dropped, k = the position in the list. One recorded run then
+     //   tests many ranges: with a defect that shows in every frame (Mario Kart World's flat "wall"), the frames where it vanishes name the range of the draw that paints it. The picture is wrong on purpose
+     { static long ss_first = -2; static int ss_n; static long ss_a[128], ss_b[128]; static long ss_lastf = -1, ss_dn;

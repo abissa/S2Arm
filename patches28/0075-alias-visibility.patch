@@ -1,0 +1,61 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index 10a769e..ff79c30 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -1250,13 +1250,18 @@ static inline void m3_wait(id e, int render, int relaxed) {
+     if (render) [(id<MTLRenderCommandEncoder>)e waitForFence:g_fence3 beforeStages:relaxed ? MTLRenderStageFragment : MTLRenderStageVertex];
+     else [(id<MTLBlitCommandEncoder>)e waitForFence:g_fence3];   // the compute encoder's selector is the same
+ }
++// S2Arm (fork) S2A_ALIAS_VIS (default on, 0 = off): every barrier also carries MTL4VisibilityOptionResourceAlias. Several Metal resources over the same memory (our shared placement-sparse tiles: one physical tile mapped into
++//   several textures; overlapping buffers) need it for a write through one to be visible through another; with the Device option alone a read through the second can see stale data (nxnative 5b84d37e measured this:
++//   "device-only barriers on both sides read stale data through a second buffer over the same memory"). Costs command-allocator memory per encoder (about 100 KB on an end barrier, nxnative's measurement)
++static inline MTL4VisibilityOptions vis_dev(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_ALIAS_VIS"); v = !(e && !strcmp(e, "0")); MLOG("barriers carry the resource-alias visibility option: %s (S2A_ALIAS_VIS)", v ? "yes" : "no"); }
++    return v ? (MTL4VisibilityOptionDevice | MTL4VisibilityOptionResourceAlias) : MTL4VisibilityOptionDevice; }
+ // Queue barriers without the main replay's profiling/fence state. Present
+ // encoders run on their own thread and must not change that state.
+ static inline void enc_full_barrier_begin(id e) {
+-    [(id<MTL4CommandEncoder>)e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
++    [(id<MTL4CommandEncoder>)e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:vis_dev()];
+ }
+ static inline void enc_full_barrier_end(id e) {
+-    [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
++    [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:vis_dev()];
+ }
+ // A full producer covers later encoders in its queue. Only reuse that proof for
+ // the immediately following main encoder in this same CB: uploads and present
+@@ -1458,7 +1463,7 @@ static inline void enc_r_end_pass(id e) {
+     if (!barrier_game()) { m4_end(e); return; }
+     if (g_m3) { m4_end(e); g_last_end_relaxed = 1; return; }   // the fence is updated after the fragment stage either way; the next pass waits before its fragments only (enc_r_begin_pass)
+     gp_end(e); { static int on_ = -1; if (on_ < 0) { const char *e_ = getenv("S2A_MESH_BARRIER"); on_ = e_ && !strcmp(e_, "1"); }   // S2Arm (fork): the pass end waits for the mesh and object stages too (nxnative orders the mesh stage; task / mesh draws draw the vegetation, whose instance lists the next frame's culling pass rewrites). OFF by default (v66 froze at frame 5116 with it on); S2A_MESH_BARRIER=1 turns it on
+-        [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | (on_ ? (MTLStageMesh | MTLStageObject) : 0) | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice]; }
++        [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | (on_ ? (MTLStageMesh | MTLStageObject) : 0) | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:vis_dev()]; }
+     [e endEncoding]; main_barrier_reset(); g_last_end_relaxed = 1;
+ }
+ static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) {
+@@ -1618,7 +1623,7 @@ static void ubd_land(void) { if (g_nubd && !g_ubd_landing) { rp_end(); g_ubd_lan
+ static void ubd_land_compute(void) { if (g_nubd && !g_ubd_landing) { ubd_land(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; } } }   // before a compute encoder of its own (no other encoder may be open then)
+ // 计算编码器内屏障（之前的派发 / 拷贝写完、之后的才读）：Metal 4 编码器内屏障，Metal 3 计算编码器的内存屏障（iOS 12 起）。blit_barrier 与 enc_c_dep 共用
+ static void enc_c_inner_barrier(id e) {
+-    if (!g_m3) [e barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
++    if (!g_m3) [e barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:vis_dev()];
+     else [(id<MTLComputeCommandEncoder>)e memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+ }
+ static void blit_barrier(void) {
+@@ -3494,7 +3499,7 @@ static void vt_probe(void) {
+         [cb beginCommandBufferWithAllocator:al];
+         id e = enc_c_begin_on(cb, YES);
+         enc_b_copy_buffer_texture(e, src, 0, 512, 65536, MTLSizeMake(128, 128, 1), a, 0, 0, MTLOriginMake(0, 0, 0));
+-        [(id<MTL4ComputeCommandEncoder>)e barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
++        [(id<MTL4ComputeCommandEncoder>)e barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:vis_dev()];
+         [e copyFromTexture:b sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(128, 128, 0) sourceSize:MTLSizeMake(128, 128, 1) toBuffer:dst destinationOffset:0 destinationBytesPerRow:512 destinationBytesPerImage:65536];
+         enc_end_on(e, YES);
+         [cb endCommandBuffer];
+@@ -14465,7 +14470,7 @@ static void dispatch(const p_dispatch *dp) {
+             enc_c_pso(ce, ps);   // enc_c_dispatch_indirect rebinds the persistent DmTable3 on this encoder
+             static int once; if (!once++) MLOG("Metal 3 indirect dispatch: GPU counts copied to c0 through a blit encoder");
+         } else if (g_c0_dim_buf) { [(id<MTL4ComputeCommandEncoder>)ce copyFromBuffer:(__bridge id<MTLBuffer>)ib sourceOffset:io toBuffer:g_c0_dim_buf destinationOffset:g_c0_dim_off size:12];
+-            [(id<MTL4ComputeCommandEncoder>)ce barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]; }
++            [(id<MTL4ComputeCommandEncoder>)ce barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:vis_dev()]; }
+         if (!own) g_gp_disp++;
+         enc_c_dispatch_indirect(ce, ig, MTLSizeMake(tg[0], tg[1], tg[2]));
+     } else { if (!own) g_gp_disp++; enc_c_dispatch(ce, MTLSizeMake(gx, gy, dp->z), MTLSizeMake(tg[0], tg[1], tg[2])); }

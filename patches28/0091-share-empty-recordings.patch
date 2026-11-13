@@ -1,0 +1,32 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index 86ffd45..4dc8ff0 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -1852,8 +1852,26 @@ static void sh_anchor_empty(cmd_t *o, srec *r) {
+     uintptr_t a = o->gvirt ? o->vanc : o->gcur > o->gstart ? o->gcur - 1 : o->gend ? o->gend - 1 : 0;
+     if (a) { r->iv[0] = (siv){a, a + 1}; r->niv = 1; }
+ }
++// S2Arm (fork): Zelda (iPhone) ends about 9 empty recordings a frame (only the END record, 8 bytes). Each was anchored at the last byte of its segment (sh_anchor_empty), which the game
++//   almost never writes again (it skips the tails), so none was released: 30,000 of them by frame 3,300, 1 KB of host blocks each, until the low 2 GB address region was full
++//   ("mmap of a 2097152-byte host chunk failed" after 17 minutes). The real recordings stayed flat at about 18,000. An empty recording's handle is now one shared END record and its
++//   blocks go back at once (nobody holds the handle before EndRecording returns it). S2A_REC_SHARE_EMPTY=0 keeps the old behaviour
++static uint8_t g_sh_end_rec[8] __attribute__((aligned(8))); static int g_sh_end_set; static uint64_t g_sh_shared;
++static int sh_share_empty_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_REC_SHARE_EMPTY"); v = !(e && *e == '0'); if (v) LOG("[nvn] S2A_REC_SHARE_EMPTY: a recording that holds only its END record gets one shared END record and frees its host blocks at once (0 = off)"); } return v; }
+ static void sh_end(cmd_t *o) {
+-    srec *r = o->rec; sh_piece(o); sh_anchor_empty(o, r);
++    srec *r = o->rec;
++    if (sh_share_empty_on() && r->rbytes == 8 && r->blk && r->blk == r->last && o->begin == (uint8_t *)(r->blk + 1)) {
++        if (!g_sh_end_set) { memcpy(g_sh_end_rec, o->begin, 8); g_sh_end_set = 1; }
++        uint64_t h = r->rbytes + OP_RESERVE + sizeof(sblk); o->hint = (uint32_t)(h < 256 ? 256 : h);
++        pthread_mutex_lock(&g_sh_mu);
++        r->prev->next = r->next; r->next->prev = r->prev; g_sh_nlive--; g_sh_live_bytes -= r->bytes;   // not indexed yet (no nodes), not in the quarantine
++        sh_free_rec(r);
++        pthread_mutex_unlock(&g_sh_mu);
++        o->begin = g_sh_end_rec; o->rec = NULL;
++        if (!(++g_sh_shared & (g_sh_shared - 1)) && g_sh_shared >= 1024) LOG("[nvn] empty recordings given the shared END record: %llu", (unsigned long long)g_sh_shared);
++        return;
++    }
++    sh_piece(o); sh_anchor_empty(o, r);
+     uint64_t h = r->rbytes + OP_RESERVE + sizeof(sblk); o->hint = (uint32_t)(h < 256 ? 256 : h > (1u << 20) ? (1u << 20) : h);
+     pthread_mutex_lock(&g_sh_mu); r->open = 0;
+     uint64_t un = 0; if (r->niv) sh_index(r); else un = ++g_sh_unanchored;

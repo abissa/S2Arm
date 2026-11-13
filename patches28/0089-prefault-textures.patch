@@ -1,0 +1,37 @@
+diff --git a/graphics/nvn/gfx/nvn/nvn_mtl.m b/graphics/nvn/gfx/nvn/nvn_mtl.m
+index e735173..f509655 100644
+--- a/graphics/nvn/gfx/nvn/nvn_mtl.m
++++ b/graphics/nvn/gfx/nvn/nvn_mtl.m
+@@ -2651,7 +2651,17 @@ static nvn_hmap g_tex_live = {.klen = 8};   // serial → (void *)1, under g_smu
+ static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_ring[NGHOST]; static unsigned g_ghost_next; static uint64_t g_ghost_puts;
+ int nvn_be_tex_is_live(uint64_t ser) { pthread_mutex_lock(&g_smu); int r = nvn_hm_get(&g_tex_live, &ser) != NULL; pthread_mutex_unlock(&g_smu); return r; }   // 这个序号的贴图对象还活着（没 Finalize / 重新初始化）
+ uint32_t nvn_be_tex_live_n(void) { pthread_mutex_lock(&g_smu); uint32_t n = g_tex_live.n; pthread_mutex_unlock(&g_smu); return n; }   // 活着的贴图对象数（宽屏胶水表满时对照：是游戏真有这么多，还是登记漏还）
+-void nvn_be_tex_init(const tex_t *t) { if (!t->serial) return; atomic_fetch_add(&g_tex_init_n, 1); pthread_mutex_lock(&g_smu); nvn_hm_put(&g_tex_live, &t->serial, (void *)1); pthread_mutex_unlock(&g_smu); }
++// S2Arm (fork): first uploads of Zelda (iPhone) spent 99% of their time in the page check reading texture memory that was not resident (145 MB/s, 56 MB arrays 420-440 ms each in the submit thread).
++//   Two measures: the pages of a big texture are requested from the pager when the game initialises it (async, nothing waits), and an upload that still finds many cold pages reads them on several threads at once.
++//   S2A_UP_PREFAULT=0 turns both off
++static int prefault_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("S2A_UP_PREFAULT"); v = !(e && *e == '0'); if (v) MLOG("S2A_UP_PREFAULT: texture pages are requested at initialisation and read in parallel at first upload (0 = off)"); } return v; }
++int nvn_sparse_pool(const void *pool);
++void nvn_be_tex_init(const tex_t *t) { if (!t->serial) return; atomic_fetch_add(&g_tex_init_n, 1); pthread_mutex_lock(&g_smu); nvn_hm_put(&g_tex_live, &t->serial, (void *)1); pthread_mutex_unlock(&g_smu);
++    if (t->mem && t->L.size >= (128u << 10) && prefault_on() && !(t->pool && nvn_sparse_pool(t->pool))) {
++        uintptr_t pg = nvn_dirty_page_size(), b = (uintptr_t)t->mem & ~(pg - 1), e = ((uintptr_t)t->mem + t->L.size + pg - 1) & ~(pg - 1);
++        static _Atomic uint64_t adv_n, adv_mb; uint64_t n = atomic_fetch_add(&adv_n, 1) + 1; atomic_fetch_add(&adv_mb, (e - b) >> 20);
++        madvise((void *)b, e - b, MADV_WILLNEED);
++        if (!(n & (n - 1)) && n >= 256) MLOG("texture page requests at initialisation: %llu textures, %llu MB", (unsigned long long)n, (unsigned long long)atomic_load(&adv_mb)); } }
+ static void obj_drop(id o) { if (alias_has(o)) defer_obj_unref(o); else defer_obj_release(o); }   // caller holds g_smu
+ // A submission can resolve more finalized textures than the ring holds (S2Arm 11-05, after upstream PR #1299 commit 2 "A bindless pool churns finalized textures within a submission",
+ //   MIT, seedds/upstream 9fb44679: about 12,000 finalized descriptors in Ocarina of Time's Kokiri Forest, 18.9 GB resident on the Mac). The ring then evicted a texture that draws already
+@@ -3867,7 +3877,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
+         if (ph && !sparse) {   // after the stamp, before the read: a write in between is after the stamp too, so the next check sees its page (and the hash may hold it, the upload does)
+             uint32_t n = page_count(t); uint64_t ud2 = bp_now();
+             { uintptr_t pgm = nvn_dirty_page_size(); char *vec = n ? malloc(n) : NULL;   // S2Arm (fork): pages of this texture not resident yet (reading them below faults them in from the file or the compressor)
+-              if (vec && mincore((void *)((uintptr_t)t->mem & ~(pgm - 1)), (size_t)n * pgm, vec) == 0) { for (uint32_t k = 0; k < n; k++) g_ud_cold += !(vec[k] & 1); g_ud_pages += n; } free(vec); }
++              if (vec && mincore((void *)((uintptr_t)t->mem & ~(pgm - 1)), (size_t)n * pgm, vec) == 0) { for (uint32_t k = 0; k < n; k++) g_ud_cold += !(vec[k] & 1); g_ud_pages += n;
++                if (g_ud_cold >= 24 && prefault_on()) {   // read the cold pages on several threads (one blocked read per page, one after the other, was 117 us a page); this thread takes a share
++                    uintptr_t base = (uintptr_t)t->mem & ~(pgm - 1); madvise((void *)base, (size_t)n * pgm, MADV_WILLNEED);
++                    size_t chunks = MIN((size_t)8, (size_t)n / 8 + 1);
++                    dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t c) {
++                        for (size_t k = (size_t)n * c / chunks, k1 = (size_t)n * (c + 1) / chunks; k < k1; k++) if (!(vec[k] & 1)) (void)*(volatile const uint8_t *)(base + k * pgm); }); } } free(vec); }
+             uint64_t *h = realloc(*ph, (size_t)MAX(n, 1u) * sizeof *h);
+             if (h) { for (uint32_t k = 0; k < n; k++) { const uint8_t *lo; size_t m; page_span(t, k, &lo, &m); h[k] = span_hash(lo, m); } *ph = h; *nph = n; g_ud_hash = bp_now() - ud2; } else { free(*ph); *ph = NULL; *nph = 0; } } }
+     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);

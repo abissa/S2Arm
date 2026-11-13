@@ -1,0 +1,66 @@
+diff --git a/graphics/nvn/gfx/nvn/hle_nvn.c b/graphics/nvn/gfx/nvn/hle_nvn.c
+index b314eab..86ffd45 100644
+--- a/graphics/nvn/gfx/nvn/hle_nvn.c
++++ b/graphics/nvn/gfx/nvn/hle_nvn.c
+@@ -1606,6 +1606,7 @@ typedef struct srec {
+     snode *nodes;               // index nodes, set at EndRecording
+     uintptr_t glo;              // start of the piece in the command buffer's current window
+     uint64_t bytes, rbytes, frame;   // host bytes of the blocks / of the records; frame of release
++    uint64_t born;                   // S2Arm (fork): presented-frame count at BeginRecording (age of a live recording)
+ } srec;
+ static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
+ static sblk *g_sh_free[SH_NCLS];
+@@ -1710,6 +1711,36 @@ static void sh_overwrite(uintptr_t lo, uintptr_t hi) {
+     if (!any) return;
+     pthread_mutex_lock(&g_sh_mu); sh_kill_range(lo, hi); pthread_mutex_unlock(&g_sh_mu);
+ }
++// S2Arm (fork): Zelda (iPhone) kept about 11 recordings per frame alive for good (378,594 live in 371 MB of host blocks after 34,500 frames; the low 2 GB address region filled and the run
++//   ended in "mmap of a 2097152-byte host chunk failed"). A recording dies only when the game's memory under it is written again or its pool is finalized.
++//   sh_age_report (with DM_NVN_CMDSTAT) says how old the live ones are and what they hold; sh_evict (S2A_REC_CAP_MB=<MB>, off by default; S2A_REC_AGE=<frames>, default 6000) frees the oldest
++//   ended recordings, oldest first, while the live host blocks exceed the cap and the oldest is older than the age: a game that submits a handle that old again would run freed blocks
++static uint64_t g_sh_evicted;
++static void sh_age_report(uint64_t f) {
++    pthread_mutex_lock(&g_sh_mu);
++    static const uint64_t lim[3] = {120, 1200, 6000}; uint64_t n[4] = {0}, b[4] = {0}, one[4] = {0}, noiv[4] = {0}; srec *old[3] = {0}; int no = 0;
++    for (srec *r = g_sh_all.next; r != &g_sh_all; r = r->next) {   // oldest first
++        if (r->open) continue;
++        uint64_t age = f - r->born; int k = age < lim[0] ? 0 : age < lim[1] ? 1 : age < lim[2] ? 2 : 3;
++        n[k]++; b[k] += r->bytes; one[k] += r->niv == 1 && r->iv[0].hi - r->iv[0].lo == 1; noiv[k] += r->niv == 0;
++        if (no < 3) old[no++] = r;
++    }
++    LOG("[nvn] live recordings by age at frame %llu (ended, MB of host blocks; one-byte anchors; none): <120 frames %llu / %.1f / %llu / %llu, <1200 %llu / %.1f / %llu / %llu, <6000 %llu / %.1f / %llu / %llu, older %llu / %.1f / %llu / %llu; freed by the age cap so far %llu",
++        (unsigned long long)f, (unsigned long long)n[0], b[0] / 1048576.0, (unsigned long long)one[0], (unsigned long long)noiv[0], (unsigned long long)n[1], b[1] / 1048576.0, (unsigned long long)one[1], (unsigned long long)noiv[1],
++        (unsigned long long)n[2], b[2] / 1048576.0, (unsigned long long)one[2], (unsigned long long)noiv[2], (unsigned long long)n[3], b[3] / 1048576.0, (unsigned long long)one[3], (unsigned long long)noiv[3], (unsigned long long)g_sh_evicted);
++    for (int i = 0; i < no; i++) { srec *r = old[i];
++        LOG("[nvn] oldest live recording #%d: age %llu frames, %u intervals, first [%#llx, %#llx), %llu host bytes, %llu record bytes", i, (unsigned long long)(f - r->born), r->niv, (unsigned long long)(r->niv ? r->iv[0].lo : 0), (unsigned long long)(r->niv ? r->iv[0].hi : 0), (unsigned long long)r->bytes, (unsigned long long)r->rbytes); }
++    pthread_mutex_unlock(&g_sh_mu);
++}
++static void sh_evict(uint64_t f) {
++    static uint64_t capb, minage; static int init;
++    if (!init) { init = 1; const char *e = getenv("S2A_REC_CAP_MB"), *a = getenv("S2A_REC_AGE"); capb = e && *e ? strtoull(e, NULL, 10) << 20 : 0; minage = a && *a ? strtoull(a, NULL, 10) : 6000;
++        if (capb) LOG("[nvn] S2A_REC_CAP_MB: recordings older than %llu frames are freed, oldest first, while the live host blocks exceed %llu MB", (unsigned long long)minage, (unsigned long long)(capb >> 20)); }
++    if (!capb) return;
++    pthread_mutex_lock(&g_sh_mu);
++    while (g_sh_live_bytes > capb) { srec *r = g_sh_all.next; if (r == &g_sh_all || r->open || f - r->born < minage) break; sh_kill(r); g_sh_evicted++; }
++    pthread_mutex_unlock(&g_sh_mu);
++}
+ // A memory pool is finalized: the recordings in its memory can no longer run on the device (also where a game drops a whole command pool instead of re-recording it)
+ static void cmdshadow_pool_gone(const uint8_t *mem, size_t n) {
+     if (!mem || !n) return;
+@@ -1836,7 +1867,7 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
+     cmd_t *o = CB(c);
+     if (o->recording) { LOG("【红】 BeginRecording re-entered"); if (o->rec) sh_end(o); }
+     srec *r = calloc(1, sizeof *r); if (!r) die("NVN command recording: no memory for a recording");
+-    r->iv = r->ivs; r->civ = 2; r->open = 1; r->glo = o->gcur;
++    r->iv = r->ivs; r->civ = 2; r->open = 1; r->glo = o->gcur; r->born = dm_nvn_frame_count();
+     pthread_mutex_lock(&g_sh_mu); r->prev = g_sh_all.prev; r->next = &g_sh_all; g_sh_all.prev->next = r; g_sh_all.prev = r; g_sh_nlive++; pthread_mutex_unlock(&g_sh_mu);
+     o->rec = r; o->cur = o->end = NULL; o->begin = NULL;
+     o->recording = 2;   // 2: recording, no command yet (cmd_alloc sets begin)
+@@ -3031,6 +3062,7 @@ static void dump_frame(void) {
+             LOG("[nvn] queue sync waits up to frame %llu: QueueWaitSync %llu, on a sync not fenced yet %llu (audit #1534 P1-23 probe)", (unsigned long long)g_frame, (unsigned long long)n0, (unsigned long long)n1); }
+     }
+     g_frame++; cs_dump();
++    if (g_frame % 300 == 0) { sh_evict(g_frame); if (cs_on()) sh_age_report(g_frame); }   // S2Arm (fork): see sh_age_report
+     // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (nvn_be_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
+     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
+     if (g_frame % 300 == 0) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
